@@ -6,19 +6,21 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../../services/ai_agent.dart';
 import '../../services/ai_client.dart';
 import '../../services/ai_context.dart' as ai_context;
 import '../../services/ai_prompt.dart';
+import '../../services/clipboard_image.dart';
 import '../../state/ai_state.dart';
 import '../../state/app_state.dart';
 import '../../utils/ai_markdown.dart';
 import '../../utils/format.dart';
 import 'ai_settings_dialog.dart';
 
-/// AI 助手分析面板（只读：不会自动执行命令）。
+/// AI 助手分析面板（命令经用户确认后发送到终端，AI 不自动执行）。
 ///
 /// 发送内容：当前活动会话最近 N 行终端输出 + 用户问题；
-/// 回复以 SSE 流式追加到对话里，代码块可一键复制。
+/// 回复以 SSE 流式追加到对话里，代码块可一键复制或一键发送到终端。
 ///
 /// 停靠面板不传注入参数（内部从 AppState 取状态）；AI 独立子窗口
 /// 通过 [chatOverride] / [settingsOverride] / [contextProvider] 注入
@@ -53,6 +55,9 @@ class AiAssistantPanel extends StatefulWidget {
     this.onPopOut,
     this.onSettingsSaved,
     this.exportWriter,
+    this.commandSender,
+    this.outputDeltaProvider,
+    this.scanProvider,
   });
 
   /// 测试可注入假的流式客户端；默认按设置构造真实 [AiClient]。
@@ -84,6 +89,19 @@ class AiAssistantPanel extends StatefulWidget {
   /// testWidgets 的 FakeAsync zone 里 dart:io 异步写盘不会完成）。
   final Future<void> Function(String path, String text)? exportWriter;
 
+  /// 把命令写入当前终端（AI「发送到终端」按钮；用户点击确认后才执行）。
+  /// 返回 null=成功，非 null=用户可读错误。缺省（null）时命令块不显示
+  /// 发送按钮；子窗口传 IPC 版本（主窗口代为执行）。
+  final Future<String?> Function(String command)? commandSender;
+
+  /// 取「上一次命令发送后」的新增终端输出（Agent 增量回传，避免每步
+  /// 重发整屏上下文造成 token 膨胀）。缺省时回退为整屏上下文采样。
+  final Future<String> Function()? outputDeltaProvider;
+
+  /// Telnet 端口扫描能力（Agent ```scan 块执行用）。缺省时扫描动作
+  /// 回传「扫描不可用」；子窗口传 IPC 版本（主窗口代为执行）。
+  final Future<String> Function(AgentScanRequest request)? scanProvider;
+
   @override
   State<AiAssistantPanel> createState() => _AiAssistantPanelState();
 }
@@ -95,6 +113,13 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
   AiChat? _chat;
   int _requestId = 0;
   bool _requestActive = false;
+
+  /// 待发送的图片附件（Ctrl+V 粘贴 / 选择文件；发送后清空）。
+  final List<AiImage> _pendingImages = [];
+  bool _attaching = false;
+
+  /// 单条消息最多附带的图片数（视觉 token 与请求体量控制）。
+  static const int _maxImagesPerMessage = 4;
 
   AiChat get _effectiveChat =>
       widget.chatOverride ?? context.read<AppState>().aiChat;
@@ -156,56 +181,93 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
 
   /// 发送一条用户提问（面板输入框 / 快捷提问入口）。
   Future<void> _send(String prompt) async {
-    final text = prompt.trim();
+    // 允许「只有图片没有文字」：给默认说明让模型结合图分析。
+    final text = prompt.trim().isEmpty && _pendingImages.isNotEmpty
+        ? '请结合附图分析。'
+        : prompt.trim();
     if (text.isEmpty) return;
     final chat = _effectiveChat;
-    if (chat.sending || _requestActive) return;
+    if (chat.sending || _requestActive) {
+      // 静默丢弃会让用户以为「消息没发出去/失忆」，明确提示。
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(
+          content: Text('上一条回复仍在生成：请等待完成或点停止后再发送'),
+          width: 380,
+          behavior: SnackBarBehavior.floating,
+        ));
+      return;
+    }
+    final images = List<AiImage>.of(_pendingImages);
     _requestActive = true;
     try {
       if (!await _ensureConfigured()) return;
       if (!mounted) return;
-      await _runCompletion(text, addUser: true);
+      final gen = ++_requestId;
+      await _runCompletion(text, addUser: true, generation: gen, images: images);
+      // Agent 模式：自动执行回复中的 ```run 命令块并继续多步任务。
+      if (mounted && gen == _requestId && _effectiveSettings.agentMode) {
+        await _runAgentLoop(gen, text);
+      }
     } finally {
       _requestActive = false;
     }
   }
 
-  /// 重新生成：移除最后一条 assistant 回复，用上一条用户提问重发。
+  /// 重新生成：移除最后一条 assistant 回复，用上一条用户提问（含图片）重发。
   Future<void> _regenerate() async {
     final chat = _effectiveChat;
     if (chat.sending || _requestActive || chat.messages.isEmpty) return;
     final last = chat.messages.last;
     if (last.role != 'assistant' || last.pending) return;
-    String? prompt;
+    AiChatMessage? userMessage;
     for (var i = chat.messages.length - 2; i >= 0; i--) {
       if (chat.messages[i].role == 'user') {
-        prompt = chat.messages[i].content.trim();
+        userMessage = chat.messages[i];
         break;
       }
     }
+    final prompt = userMessage?.content.trim();
     if (prompt == null || prompt.isEmpty) return;
     _requestActive = true;
     try {
       chat.popLastAssistant();
-      await _runCompletion(prompt);
+      await _runCompletion(prompt,
+          images: userMessage?.images ?? const <AiImage>[]);
     } finally {
       _requestActive = false;
     }
   }
 
-  /// 构造上下文并发起一次流式补全（发送与重新生成共用）。
-  Future<void> _runCompletion(String text, {bool addUser = false}) async {
+  /// 构造上下文并发起一次流式补全（发送 / 重新生成 / Agent 续步共用）。
+  ///
+  /// [generation] 由调用方持有整个请求链路的代际号（Agent 循环跨多次
+  /// 请求共用一个代际号，停止即整链终止）；缺省时自增开启新链路。
+  /// [includeContext] 为 false 时不附带整屏终端上下文（Agent 续步用）。
+  /// [images] 为本条用户消息附带的图片（多模态，需模型支持视觉）。
+  Future<void> _runCompletion(
+    String text, {
+    bool addUser = false,
+    int? generation,
+    bool includeContext = true,
+    List<AiImage> images = const [],
+  }) async {
     final chat = _effectiveChat;
     final settings = _effectiveSettings;
-    final requestId = ++_requestId;
-    final contextText = await (widget.contextProvider?.call() ??
-        Future.value(ai_context.buildContextFromAppState(
-            context.read<AppState>())));
+    final requestId = generation ?? ++_requestId;
+    final contextText = includeContext
+        ? await (widget.contextProvider?.call() ??
+            Future.value(ai_context.buildContextFromAppState(
+                context.read<AppState>())))
+        : '';
     if (!mounted || requestId != _requestId) return;
     final history = chat.historyForRequest();
     if (addUser) {
-      chat.addUser(text);
+      chat.addUser(text, images: images);
       _input.clear();
+      if (images.isNotEmpty && mounted) {
+        setState(() => _pendingImages.clear());
+      }
     }
     chat.beginAssistant();
 
@@ -223,6 +285,8 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
         context: contextText,
         prompt: text,
         history: history,
+        promptImages: images,
+        agentMode: settings.agentMode,
       );
       var truncated = false;
       await for (final chunk in client.streamChat(messages)) {
@@ -246,11 +310,367 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
     }
   }
 
+  /// Agent 自动执行链路：分析回复里的 ```run 命令块 → 安全分级 →
+  /// 执行（危险命令弹确认）→ 回传最新终端输出 → 让模型继续，直到
+  /// 没有待执行命令 / 用户停止 / 达到步数上限。
+  ///
+  /// [task] 为用户本次的原始任务文本：每步续步都把它锚定在提示词里，
+  /// 防止历史窗口滚动后模型忘记目标（表现为「丢失记忆」）。
+  Future<void> _runAgentLoop(int gen, String task) async {
+    final sender = widget.commandSender;
+    for (var step = 1; step <= agentMaxSteps; step++) {
+      if (!mounted || gen != _requestId) return;
+      final chat = _effectiveChat;
+      final last = chat.messages.lastOrNull;
+      if (last == null || last.role != 'assistant' || last.pending) return;
+
+      // ---- 端口扫描动作（```scan 块，优先于命令执行） ----
+      final scanRaw = extractScanBlock(last.content);
+      if (scanRaw != null) {
+        AgentScanRequest request;
+        try {
+          request = parseScanRequest(scanRaw);
+        } on FormatException catch (e) {
+          if (!mounted || gen != _requestId) return;
+          chat.addUser('【扫描请求无效】${e.message}\n'
+              '请修正 JSON 后重试（示例：{"host":"127.0.0.1",'
+              '"startPort":32768,"endPort":32800}）。');
+          await _runAgentContinuation(gen, task);
+          continue;
+        }
+        // 远程主机扫描需用户确认（本机直接执行）。
+        if (!isLocalScanHost(request.host)) {
+          final ok = await _confirmRemoteScan(request);
+          if (!mounted || gen != _requestId) return;
+          if (!ok) {
+            chat.addUser('【用户跳过扫描】${request.label} 未执行。');
+            await _runAgentContinuation(gen, task);
+            continue;
+          }
+        }
+        final scanProvider = widget.scanProvider;
+        if (scanProvider == null) {
+          chat.addUser('【扫描不可用】当前环境未启用端口扫描能力。');
+          await _runAgentContinuation(gen, task);
+          continue;
+        }
+        final summary = await scanProvider(request);
+        if (!mounted || gen != _requestId) return;
+        chat.addUser('【Telnet 扫描结果 · ${request.label}】\n$summary');
+        await _runAgentContinuation(gen, task);
+        continue;
+      }
+
+      final command = extractRunCommand(last.content);
+      if (command == null || command.trim().isEmpty) return; // 链路自然结束
+      if (sender == null) return; // 无发送通道（只读兜底）
+
+      // ---- 安全分级 ----
+      final verdict = classifyAgentCommand(command);
+      if (verdict == AgentCommandVerdict.blocked) {
+        if (!mounted || gen != _requestId) return;
+        chat.addUser('【自动执行被拦截】以下命令命中安全策略，不会自动执行，'
+            '请用户手动处理或让 AI 给出替代方案：\n```\n$command\n```');
+        await _runAgentContinuation(gen, task);
+        continue;
+      }
+      if (verdict == AgentCommandVerdict.confirm) {
+        final ok = await _confirmAgentCommand(command);
+        if (!mounted || gen != _requestId) return;
+        if (!ok) {
+          chat.addUser('【用户跳过执行】以下命令未执行：\n```\n$command\n```');
+          await _runAgentContinuation(gen, task);
+          continue;
+        }
+      }
+
+      // ---- 执行 ----
+      final error = await sender(command);
+      if (!mounted || gen != _requestId) return;
+      if (error != null) {
+        chat.addUser('【发送失败】命令未执行：$error');
+        return;
+      }
+      final output = await _captureStableDelta();
+      if (!mounted || gen != _requestId) return;
+      chat.addUser('【命令执行结果 · 第 $step 步】\n$output');
+
+      // ---- 回传输出，让模型继续 ----
+      await _runAgentContinuation(gen, task);
+    }
+    if (mounted && gen == _requestId) {
+      _effectiveChat.addUser('【系统提示】已达单次自动执行步数上限'
+          '（$agentMaxSteps 步），链路已暂停。回复「继续」可再执行，'
+          '或改用命令块上的发送按钮手动执行。');
+    }
+  }
+
+  /// Agent 续步请求（提示词仅进入请求，不作为可见气泡）。
+  ///
+  /// 不再附带整屏终端上下文：上一步的命令输出已作为「命令执行结果」
+  /// 消息进入历史，重复附带会让每步请求 token 线性膨胀。
+  /// 注：这里显式锚定「原始任务」——历史窗口滚动后模型仍知道目标，
+  /// 不会因为看不到最初的用户消息而重新问需求（「丢失记忆」修复）。
+  Future<void> _runAgentContinuation(int gen, String task) async {
+    final anchor = task.trim();
+    final brief =
+        anchor.length > 500 ? '${anchor.substring(0, 500)}…' : anchor;
+    await _runCompletion(
+      '（上一步命令已执行完毕，请基于最新终端输出继续分析。\n'
+      '原始任务：$brief\n'
+      '需要更多输出就再给一个 ```run 代码块，分析完成就输出'
+      '「=== 结论 ===」总结并停止给 run 块。）',
+      generation: gen,
+      includeContext: false,
+    );
+  }
+
+  /// 命令执行后等待输出稳定再取回传内容。
+  ///
+  /// 优先用增量通道（只回传该命令新增的输出）；未注入时回退为整屏
+  /// 上下文采样（旧行为，token 较大但兼容）。
+  Future<String> _captureStableDelta() async {
+    final deltaProvider = widget.outputDeltaProvider;
+    if (deltaProvider == null) return _captureStableOutput();
+    var prev = await deltaProvider();
+    for (var i = 0; i < 3; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return prev;
+      final next = await deltaProvider();
+      if (next == prev) return next;
+      prev = next;
+    }
+    return prev;
+  }
+
+  /// 整屏上下文采样（无增量通道时的回退）。
+  Future<String> _captureStableOutput() async {
+    Future<String> capture() {
+      final provider = widget.contextProvider;
+      if (provider != null) return provider();
+      return Future.value(ai_context.buildContextFromAppState(
+          context.read<AppState>()));
+    }
+
+    var prev = await capture();
+    for (var i = 0; i < 3; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return prev;
+      final next = await capture();
+      if (next == prev) return next;
+      prev = next;
+    }
+    return prev;
+  }
+
+  /// 高危命令确认对话框（Agent 模式）：返回是否执行。
+  Future<bool> _confirmAgentCommand(String command) async {
+    final scheme = Theme.of(context).colorScheme;
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: scheme.error, size: 22),
+            const SizedBox(width: 8),
+            const Text('确认执行该命令'),
+          ],
+        ),
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Agent 模式下的以下命令存在变更/破坏风险，需要你确认：',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: scheme.errorContainer.withValues(alpha: 0.5),
+                  border: Border.all(color: scheme.outlineVariant),
+                ),
+                child: SelectableText(
+                  command,
+                  style: const TextStyle(
+                    fontFamily: 'Consolas',
+                    fontFamilyFallback: ['Cascadia Mono', 'Courier New'],
+                    fontSize: 12.5,
+                    height: 1.5,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('跳过不执行'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: scheme.error,
+              foregroundColor: scheme.onError,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认执行'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  /// 远程主机扫描确认对话框（本机地址直接执行）。
+  Future<bool> _confirmRemoteScan(AgentScanRequest request) async {
+    final scheme = Theme.of(context).colorScheme;
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.radar, color: scheme.error, size: 22),
+            const SizedBox(width: 8),
+            const Text('确认扫描远程主机'),
+          ],
+        ),
+        content: SizedBox(
+          width: 440,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Agent 请求对非本机地址发起 TCP 端口扫描，'
+                '可能触发目标侧安全告警或策略限制：',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: scheme.errorContainer.withValues(alpha: 0.5),
+                  border: Border.all(color: scheme.outlineVariant),
+                ),
+                child: SelectableText(
+                  request.label,
+                  style: const TextStyle(
+                    fontFamily: 'Consolas',
+                    fontFamilyFallback: ['Cascadia Mono', 'Courier New'],
+                    fontSize: 12.5,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '共 ${request.endPort - request.startPort + 1} 个端口。'
+                '仅在你确认拥有该设备的测试/运维授权时执行。',
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: scheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('跳过不扫描'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: scheme.error,
+              foregroundColor: scheme.onError,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认扫描'),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
   void _stop() {
     _requestId++;
     _effectiveChat.stop();
     unawaited(_client?.close());
     _client = null;
+  }
+
+  /// 从文件选择器附加图片。
+  Future<void> _attachFromFile() async {
+    final file = await openFile(acceptedTypeGroups: const [
+      XTypeGroup(
+          label: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp']),
+    ]);
+    if (file == null) return;
+    final bytes = await file.readAsBytes();
+    await _attachImageBytes(bytes, fromClipboard: false);
+  }
+
+  /// 输入框按键：Ctrl+V 且剪贴板有位图时附加图片；否则放行（文本粘贴）。
+  KeyEventResult _onComposerKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (!HardwareKeyboard.instance.isControlPressed) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey != LogicalKeyboardKey.keyV) {
+      return KeyEventResult.ignored;
+    }
+    // 没有位图时不拦截：走 TextField 自己的文本粘贴。
+    if (!ClipboardImage.hasImage()) return KeyEventResult.ignored;
+    unawaited(_attachImageBytes(null, fromClipboard: true));
+    return KeyEventResult.handled;
+  }
+
+  /// 附加一张图片（剪贴板或文件），统一压缩到最长边 1568 的 PNG。
+  Future<void> _attachImageBytes(
+    Uint8List? fileBytes, {
+    required bool fromClipboard,
+  }) async {
+    if (_attaching) return;
+    if (_pendingImages.length >= _maxImagesPerMessage) {
+      _snack('最多附加 $_maxImagesPerMessage 张图片');
+      return;
+    }
+    setState(() => _attaching = true);
+    Uint8List? png;
+    try {
+      png = fromClipboard
+          ? await ClipboardImage.readImagePng()
+          : await ClipboardImage.normalizeImageBytes(fileBytes!);
+    } catch (_) {
+      png = null;
+    }
+    if (!mounted) return;
+    setState(() {
+      _attaching = false;
+      if (png != null) {
+        _pendingImages.add(AiImage(mime: 'image/png', bytes: png));
+      }
+    });
+    if (png == null) _snack('图片读取失败或格式不支持');
+  }
+
+  void _snack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(message),
+        width: 380,
+        behavior: SnackBarBehavior.floating,
+      ));
   }
 
   /// 导出一条 AI 回复为 TXT（系统对话框选保存位置）。
@@ -328,8 +748,8 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
 
   Widget _buildHeader(BuildContext context, AiChat chat, AiSettings settings) {
     final scheme = Theme.of(context).colorScheme;
-    // 面板宽度可拖动调整：窄面板时隐藏「只读分析」徽标避免溢出
-    // （只读提示在底部输入区的说明行里仍有保留）。
+    // 面板宽度可拖动调整：窄面板时隐藏「命令需确认执行」徽标避免溢出
+    // （安全提示在底部输入区的说明行里仍有保留）。
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 4, 2),
       child: LayoutBuilder(builder: (context, constraints) {
@@ -355,13 +775,31 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
                   border: Border.all(color: scheme.outlineVariant),
                   borderRadius: BorderRadius.zero,
                 ),
-                child: Text('只读分析',
+                child: Text('命令需确认执行',
                     style: Theme.of(context)
                         .textTheme
                         .labelSmall
                         ?.copyWith(color: scheme.onSurfaceVariant)),
               ),
             ],
+            const SizedBox(width: 2),
+            // Agent 自动执行开关（run 块自动执行，高危命令仍弹确认）。
+            IconButton(
+              tooltip: settings.agentMode
+                  ? 'Agent 自动执行：开（点击关闭）'
+                  : 'Agent 自动执行：关（点击开启后，run 代码块将自动执行）',
+              iconSize: 18,
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                Icons.bolt_rounded,
+                color: settings.agentMode ? scheme.primary : scheme.onSurfaceVariant,
+              ),
+              onPressed: () {
+                settings.setAgentMode(!settings.agentMode);
+                // 子窗口：写盘并通知主窗口重载；停靠模式由 AppState 监听落盘。
+                widget.onSettingsSaved?.call();
+              },
+            ),
             const Spacer(),
             if (widget.onPopOut != null)
               IconButton(
@@ -466,6 +904,7 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
           // 只有最后一条 AI 回复可重新生成（避免截断后续对话的歧义）。
           onRegenerate: done && isLastAssistant ? _regenerate : null,
           onExport: done ? () => _exportMessage(message) : null,
+          commandSender: widget.commandSender,
         );
       },
     );
@@ -482,8 +921,8 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
         Text('AI 会读取当前终端最近输出，帮你解释报错、'
             '分析设备状态、生成排查命令。', style: textTheme.bodySmall),
         const SizedBox(height: 6),
-        Text('只读：AI 不会自动执行任何命令，命令需要你手动复制执行。',
-            style: textTheme.bodySmall
+        Text('AI 不会自动执行命令：代码块上的「发送」按钮由你确认后'
+            '才写入当前终端。', style: textTheme.bodySmall
                 ?.copyWith(color: scheme.onSurfaceVariant)),
         const SizedBox(height: 16),
         for (final quick in aiQuickPrompts)
@@ -550,36 +989,108 @@ class _AiAssistantPanelState extends State<AiAssistantPanel> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          CallbackShortcuts(
-            bindings: {
-              const SingleActivator(LogicalKeyboardKey.enter, control: true):
-                  () => _send(_input.text),
-            },
-            child: TextField(
-              controller: _input,
-              minLines: 1,
-              maxLines: 5,
-              textInputAction: TextInputAction.newline,
-              decoration: InputDecoration(
-                hintText: '问 AI：分析当前终端 / 解释报错 / 生成排查命令…',
-                isDense: true,
-                suffixIcon: sending
-                    ? IconButton(
-                        tooltip: '停止生成',
-                        icon: const Icon(Icons.stop_circle_outlined),
-                        onPressed: _stop,
-                      )
-                    : IconButton(
-                        tooltip: '发送（Ctrl+Enter）',
-                        icon: const Icon(Icons.send),
-                        onPressed: () => _send(_input.text),
+          if (_pendingImages.isNotEmpty) ...[
+            SizedBox(
+              height: 66,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: _pendingImages.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 6),
+                itemBuilder: (context, index) {
+                  final image = _pendingImages[index];
+                  return Stack(
+                    children: [
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(color: scheme.outlineVariant),
+                        ),
+                        child: Image.memory(
+                          image.bytes,
+                          width: 88,
+                          height: 64,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                        ),
                       ),
+                      Positioned(
+                        top: 2,
+                        right: 2,
+                        child: InkWell(
+                          onTap: () =>
+                              setState(() => _pendingImages.removeAt(index)),
+                          child: Container(
+                            padding: const EdgeInsets.all(2),
+                            color: scheme.error,
+                            child: Icon(Icons.close,
+                                size: 12, color: scheme.onError),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
               ),
             ),
+            const SizedBox(height: 6),
+          ],
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: Focus(
+                  // Ctrl+V：剪贴板有图片时附加图片；否则按文本粘贴走原逻辑。
+                  onKeyEvent: _onComposerKey,
+                  child: CallbackShortcuts(
+                    bindings: {
+                      const SingleActivator(LogicalKeyboardKey.enter,
+                              control: true):
+                          () => _send(_input.text),
+                    },
+                    child: TextField(
+                      controller: _input,
+                      minLines: 1,
+                      maxLines: 5,
+                      textInputAction: TextInputAction.newline,
+                      decoration: InputDecoration(
+                        hintText: _pendingImages.isEmpty
+                            ? '问 AI：分析当前终端 / 解释报错 / 生成排查命令…'
+                            : '描述图片中的目标（Ctrl+Enter 发送）…',
+                        isDense: true,
+                        suffixIcon: sending
+                            ? IconButton(
+                                tooltip: '停止生成',
+                                icon: const Icon(Icons.stop_circle_outlined),
+                                onPressed: _stop,
+                              )
+                            : IconButton(
+                                tooltip: '发送（Ctrl+Enter）',
+                                icon: const Icon(Icons.send),
+                                onPressed: () => _send(_input.text),
+                              ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '附加图片：可 Ctrl+V 粘贴截图，或选择图片文件\n'
+                    '需模型支持视觉（如 gpt-4o / qwen-vl / gemini）',
+                icon: _attaching
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.image_outlined),
+                onPressed:
+                    _attaching ? null : () => unawaited(_attachFromFile()),
+              ),
+            ],
           ),
           const SizedBox(height: 6),
           Text(
-            '发送到 ${settings.baseUrl} · 只读分析，不会执行命令',
+            settings.agentMode
+                ? '发送到 ${settings.baseUrl} · Agent 模式：```run 代码块自动执行（高危仍需确认）'
+                : '发送到 ${settings.baseUrl} · 命令经你确认后才会发送到终端',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context)
@@ -599,6 +1110,7 @@ class _MessageView extends StatelessWidget {
     required this.message,
     this.onRegenerate,
     this.onExport,
+    this.commandSender,
   });
 
   final AiChatMessage message;
@@ -606,6 +1118,9 @@ class _MessageView extends StatelessWidget {
   /// 非 null 时气泡底部显示对应小按钮（重新生成 / 导出 TXT）。
   final VoidCallback? onRegenerate;
   final VoidCallback? onExport;
+
+  /// 非 null 时命令代码块显示「发送到终端」按钮。
+  final Future<String?> Function(String command)? commandSender;
 
   @override
   Widget build(BuildContext context) {
@@ -621,12 +1136,43 @@ class _MessageView extends StatelessWidget {
             color: scheme.primaryContainer,
             border: Border.all(color: scheme.outlineVariant),
           ),
-          child: SelectableText(
-            message.content,
-            style: Theme.of(context)
-                .textTheme
-                .bodySmall
-                ?.copyWith(color: scheme.onPrimaryContainer, height: 1.45),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              if (message.images.isNotEmpty) ...[
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  alignment: WrapAlignment.end,
+                  children: [
+                    for (final image in message.images)
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(color: scheme.outlineVariant),
+                        ),
+                        child: Image.memory(
+                          image.bytes,
+                          width: 180,
+                          height: 120,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                        ),
+                      ),
+                  ],
+                ),
+                if (message.content.isNotEmpty) const SizedBox(height: 8),
+              ],
+              if (message.content.isNotEmpty)
+                SelectableText(
+                  message.content,
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(
+                          color: scheme.onPrimaryContainer, height: 1.45),
+                ),
+            ],
           ),
         ),
       );
@@ -818,6 +1364,9 @@ class _MessageView extends StatelessWidget {
       AiCodeBlock(:final code, :final language) => _CodeBlockView(
           code: code,
           language: language,
+          onSend: commandSender == null
+              ? null
+              : () async => await commandSender!(code),
         ),
       AiTableBlock(:final header, :final rows, :final alignments) =>
         Padding(
@@ -1142,28 +1691,77 @@ class _TableView extends StatelessWidget {
   }
 }
 
-/// 代码块：等宽字体 + 复制按钮（命令需要用户手动粘贴执行）。
+/// 代码块：等宽字体 + 复制按钮 + 「发送到终端」按钮（发送前需在
+/// 命令块上显式点击确认，AI 绝不自动执行）。
 /// shell 类语言标终端图标，未标注语言的裸 ``` 按「命令」呈现。
-class _CodeBlockView extends StatelessWidget {
-  const _CodeBlockView({required this.code, required this.language});
+class _CodeBlockView extends StatefulWidget {
+  const _CodeBlockView({
+    required this.code,
+    required this.language,
+    this.onSend,
+  });
 
+  final String code;
+  final String language;
+
+  /// 非 null 时显示「发送到终端」按钮；返回 null=成功，非 null=错误文案。
+  final Future<String?> Function()? onSend;
+
+  @override
+  State<_CodeBlockView> createState() => _CodeBlockViewState();
+}
+
+class _CodeBlockViewState extends State<_CodeBlockView> {
   static const _shellLanguages = {
     'bash', 'sh', 'shell', 'zsh', 'console', 'powershell', 'pwsh',
     'ps1', 'cmd', 'batch', 'bat',
   };
 
-  final String code;
-  final String language;
+  bool _sending = false;
+  bool _sent = false;
+
+  Future<void> _send() async {
+    final onSend = widget.onSend;
+    if (onSend == null || _sending) return;
+    setState(() => _sending = true);
+    String? error;
+    try {
+      error = await onSend();
+    } catch (e) {
+      error = e.toString();
+    }
+    if (!mounted) return;
+    setState(() {
+      _sending = false;
+      if (error == null) _sent = true;
+    });
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(error ?? '命令已发送到当前终端'),
+        width: 320,
+        behavior: SnackBarBehavior.floating,
+      ));
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final isShell = _shellLanguages.contains(language.toLowerCase());
+    final lang = widget.language.toLowerCase();
+    final isRun = lang == 'run';
+    final isScan = lang == 'scan';
+    final isShell = _shellLanguages.contains(lang) || isRun;
+    final code = widget.code;
+    final language = widget.language;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
         color: scheme.surfaceContainerHigh,
-        border: Border.all(color: scheme.outlineVariant),
+        border: Border.all(
+          color: isRun || isScan
+              ? scheme.primary.withValues(alpha: 0.55)
+              : scheme.outlineVariant,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1178,22 +1776,55 @@ class _CodeBlockView extends StatelessWidget {
             child: Row(
               children: [
                 Icon(
-                  isShell ? Icons.terminal_rounded : Icons.code_rounded,
+                  isScan
+                      ? Icons.radar
+                      : isRun
+                          ? Icons.bolt_rounded
+                          : isShell
+                              ? Icons.terminal_rounded
+                              : Icons.code_rounded,
                   size: 13,
-                  color: scheme.onSurfaceVariant,
+                  color: isRun || isScan
+                      ? scheme.primary
+                      : scheme.onSurfaceVariant,
                 ),
                 const SizedBox(width: 5),
                 Expanded(
                   child: Text(
                     language.isEmpty
                         ? (isShell ? '命令' : '代码')
-                        : language,
+                        : isScan
+                            ? 'Telnet 扫描（自动执行）'
+                            : isRun
+                                ? 'Agent 命令（自动执行）'
+                                : language,
                     style: Theme.of(context)
                         .textTheme
                         .labelSmall
                         ?.copyWith(color: scheme.onSurfaceVariant),
                   ),
                 ),
+                // scan 块由 Agent 循环执行，不提供发送到终端按钮。
+                if (widget.onSend != null && !isScan)
+                  IconButton(
+                    tooltip: _sent
+                        ? '再次发送到当前终端并执行'
+                        : '发送到当前终端并执行',
+                    iconSize: 16,
+                    visualDensity: VisualDensity.compact,
+                    icon: _sending
+                        ? const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : Icon(
+                            _sent
+                                ? Icons.check_rounded
+                                : Icons.play_arrow_rounded,
+                            color: _sent ? scheme.primary : null,
+                          ),
+                    onPressed: _send,
+                  ),
                 IconButton(
                   tooltip: '复制代码',
                   iconSize: 16,

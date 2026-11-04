@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../../services/ai_agent.dart';
 import '../../services/window_protocol.dart';
 import '../../state/ai_state.dart';
 import '../../state/app_state.dart';
@@ -41,6 +42,15 @@ Future<void> runAiWindow() async {
   // ---- 终端上下文经 IPC 向主窗口索取 ----
   var reqSeq = 0;
   final contextWaiters = <int, Completer<String>>{};
+
+  // ---- 命令发送经 IPC 由主窗口执行 ----
+  final commandWaiters = <int, Completer<String?>>{};
+
+  // ---- 命令输出增量经 IPC 向主窗口索取 ----
+  final deltaWaiters = <int, Completer<String>>{};
+
+  // ---- Agent 端口扫描经 IPC 由主窗口执行 ----
+  final scanWaiters = <int, Completer<String>>{};
 
   // ---- 对话迁移与关闭拦截 ----
   void backupSnapshot() {
@@ -81,6 +91,24 @@ Future<void> runAiWindow() async {
         final reqId = args['reqId'] as int?;
         final text = args['text'] as String? ?? '';
         if (reqId != null) contextWaiters.remove(reqId)?.complete(text);
+        return null;
+      case WindowProtocol.aiSendCommandReply:
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'] as int?;
+        final error = args['error'] as String?;
+        if (reqId != null) commandWaiters.remove(reqId)?.complete(error);
+        return null;
+      case WindowProtocol.aiTelnetScanReply:
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'] as int?;
+        final text = args['text'] as String? ?? '';
+        if (reqId != null) scanWaiters.remove(reqId)?.complete(text);
+        return null;
+      case WindowProtocol.aiOutputDeltaReply:
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'] as int?;
+        final text = args['text'] as String? ?? '';
+        if (reqId != null) deltaWaiters.remove(reqId)?.complete(text);
         return null;
       case WindowProtocol.aiCollectAndClose:
         // 主窗口收回：备份 + 关闭（关闭回执经 closeSelf 触发）。
@@ -138,6 +166,48 @@ Future<void> runAiWindow() async {
                 onTimeout: () => '（获取终端上下文超时；请基于通用网络知识回答。）',
               );
             },
+            commandSender: (command) {
+              final reqId = ++reqSeq;
+              final completer = Completer<String?>();
+              commandWaiters[reqId] = completer;
+              unawaited(channel
+                  .invokeMethod(WindowProtocol.aiSendCommand,
+                      {'reqId': reqId, 'command': command})
+                  .catchError((_) {}));
+              return completer.future.timeout(
+                const Duration(seconds: 2),
+                onTimeout: () => '发送超时（主窗口无应答）',
+              );
+            },
+            outputDeltaProvider: () {
+              final reqId = ++reqSeq;
+              final completer = Completer<String>();
+              deltaWaiters[reqId] = completer;
+              unawaited(channel
+                  .invokeMethod(WindowProtocol.aiGetOutputDelta, {'reqId': reqId})
+                  .catchError((_) {}));
+              return completer.future.timeout(
+                const Duration(seconds: 2),
+                onTimeout: () => '（获取命令输出超时）',
+              );
+            },
+            scanProvider: (request) {
+              final reqId = ++reqSeq;
+              final completer = Completer<String>();
+              scanWaiters[reqId] = completer;
+              unawaited(channel
+                  .invokeMethod(WindowProtocol.aiTelnetScan, {
+                'reqId': reqId,
+                'host': request.host,
+                'startPort': request.startPort,
+                'endPort': request.endPort,
+              }).catchError((_) {}));
+              // 扫描最长可达数十秒（4096 端口上限），给足超时。
+              return completer.future.timeout(
+                const Duration(seconds: 120),
+                onTimeout: () => '（扫描超时：主窗口无应答）',
+              );
+            },
           );
         },
       ),
@@ -164,6 +234,9 @@ class _AiWindowApp extends StatelessWidget {
     required this.chat,
     required this.settings,
     required this.contextProvider,
+    required this.commandSender,
+    required this.outputDeltaProvider,
+    required this.scanProvider,
     required this.backupAndClose,
     required this.disposeHook,
     required this.theme,
@@ -174,6 +247,9 @@ class _AiWindowApp extends StatelessWidget {
   final AiChat chat;
   final AiSettings settings;
   final Future<String> Function() contextProvider;
+  final Future<String?> Function(String command) commandSender;
+  final Future<String> Function() outputDeltaProvider;
+  final Future<String> Function(AgentScanRequest request) scanProvider;
   final Future<void> Function() backupAndClose;
   final VoidCallback disposeHook;
   final ThemeData theme;
@@ -191,6 +267,9 @@ class _AiWindowApp extends StatelessWidget {
         chat: chat,
         settings: settings,
         contextProvider: contextProvider,
+        commandSender: commandSender,
+        outputDeltaProvider: outputDeltaProvider,
+        scanProvider: scanProvider,
         backupAndClose: backupAndClose,
         disposeHook: disposeHook,
       ),
@@ -203,6 +282,9 @@ class _AiWindowScaffold extends StatelessWidget {
     required this.chat,
     required this.settings,
     required this.contextProvider,
+    required this.commandSender,
+    required this.outputDeltaProvider,
+    required this.scanProvider,
     required this.backupAndClose,
     required this.disposeHook,
   });
@@ -210,6 +292,9 @@ class _AiWindowScaffold extends StatelessWidget {
   final AiChat chat;
   final AiSettings settings;
   final Future<String> Function() contextProvider;
+  final Future<String?> Function(String command) commandSender;
+  final Future<String> Function() outputDeltaProvider;
+  final Future<String> Function(AgentScanRequest request) scanProvider;
   final Future<void> Function() backupAndClose;
   final VoidCallback disposeHook;
 
@@ -220,6 +305,9 @@ class _AiWindowScaffold extends StatelessWidget {
         chatOverride: chat,
         settingsOverride: settings,
         contextProvider: contextProvider,
+        commandSender: commandSender,
+        outputDeltaProvider: outputDeltaProvider,
+        scanProvider: scanProvider,
         // 独立窗口内没有主窗口的活动会话信息，导出头不写会话行。
         onCloseOverride: () {
           disposeHook();

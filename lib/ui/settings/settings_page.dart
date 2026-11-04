@@ -501,7 +501,9 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         ),
         const SizedBox(height: 12),
         Text(
-          'AI 只读取当前终端上下文并生成分析文本，不会自动执行设备命令。',
+          ai.agentMode
+              ? 'Agent 模式已开启：AI 给出的 ```run 命令块将自动写入当前终端（高危命令仍需确认），并自动继续多步任务。'
+              : 'AI 读取当前终端上下文生成分析；命令仅在你点击「发送」确认后才写入终端。',
           style: Theme.of(context).textTheme.bodySmall
               ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
         ),

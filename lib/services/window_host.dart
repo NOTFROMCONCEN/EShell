@@ -4,6 +4,7 @@ import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'ai_agent.dart';
 import 'ai_context.dart';
 import 'window_protocol.dart';
 import '../state/app_state.dart';
@@ -139,6 +140,43 @@ class MultiWindowHost extends ChangeNotifier {
         final text = buildContextFromAppState(_app);
         await const WindowMethodChannel(WindowProtocol.aiChannel).invokeMethod(
           WindowProtocol.aiContextReply,
+          {'reqId': reqId, 'text': text},
+        );
+        return null;
+      case WindowProtocol.aiSendCommand:
+        // AI 子窗口请求把命令写入主窗口活动会话（用户已在子窗口点击
+        // 「发送到终端」确认）；执行结果应答回子窗口展示。
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'];
+        final error = _app.sendCommandToActiveSession(
+            args['command'] as String? ?? '');
+        await const WindowMethodChannel(WindowProtocol.aiChannel).invokeMethod(
+          WindowProtocol.aiSendCommandReply,
+          {'reqId': reqId, if (error != null) 'error': error},
+        );
+        return null;
+      case WindowProtocol.aiTelnetScan:
+        // AI 子窗口请求端口扫描（Agent `scan 块，主窗口代为执行）。
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'];
+        final summary = await runTelnetScanForAgent(AgentScanRequest(
+          host: args['host'] as String? ?? '127.0.0.1',
+          startPort: args['startPort'] as int? ?? 1,
+          endPort: args['endPort'] as int? ?? 1,
+        ));
+        await const WindowMethodChannel(WindowProtocol.aiChannel).invokeMethod(
+          WindowProtocol.aiTelnetScanReply,
+          {'reqId': reqId, 'text': summary},
+        );
+        return null;
+      case WindowProtocol.aiGetOutputDelta:
+        // AI 子窗口取命令输出增量（Agent 每步只回传新增输出，避免
+        // 整屏上下文重复灌入导致 token 膨胀）。
+        final args = call.arguments as Map? ?? const {};
+        final reqId = args['reqId'];
+        final text = _app.captureCommandOutputDelta();
+        await const WindowMethodChannel(WindowProtocol.aiChannel).invokeMethod(
+          WindowProtocol.aiOutputDeltaReply,
           {'reqId': reqId, 'text': text},
         );
         return null;

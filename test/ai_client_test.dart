@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:eshell/services/ai_client.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -234,6 +235,36 @@ void main() {
       );
       await client.close();
       await server.close(force: true);
+    });
+  });
+
+  group('AiMessage 多模态序列化', () {
+    test('无图片时 content 保持字符串', () {
+      final json = const AiMessage(role: 'user', content: 'hi').toJson();
+      expect(json['content'], 'hi');
+      expect(json['role'], 'user');
+    });
+
+    test('带图片时 content 为 text + image_url 数组', () {
+      final message = AiMessage(
+        role: 'user',
+        content: '这是网络拓扑，请分析',
+        images: [
+          AiImage(
+            mime: 'image/png',
+            bytes: Uint8List.fromList([0x89, 0x50, 0x4E, 0x47]),
+          ),
+        ],
+      );
+      final json = message.toJson();
+      final content = json['content'] as List;
+      expect(content, hasLength(2));
+      expect(content[0], {'type': 'text', 'text': '这是网络拓扑，请分析'});
+      final imagePart = content[1] as Map;
+      expect(imagePart['type'], 'image_url');
+      final url = (imagePart['image_url'] as Map)['url'] as String;
+      expect(url, startsWith('data:image/png;base64,'));
+      expect(url, contains(base64Encode([0x89, 0x50, 0x4E, 0x47])));
     });
   });
 }

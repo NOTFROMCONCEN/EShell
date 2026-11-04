@@ -56,4 +56,46 @@ void main() {
       expect(conn.status, ConnStatus.failed);
     });
   });
+
+  group('TerminalConnection.sendCommand · AI 发送到终端', () {
+    SshConnection makeConn({ConnStatus status = ConnStatus.connected}) {
+      final conn = SshConnection(
+        session: Session(id: 's1', name: '', host: 'h', username: 'u'),
+      );
+      conn.status = status;
+      return conn;
+    }
+
+    test('已连接：发送命令并补回车', () {
+      final conn = makeConn();
+      final out = <String>[];
+      conn.terminal.onOutput = out.add;
+      conn.sendCommand('  show version  ');
+      expect(out.join(), 'show version\r');
+    });
+
+    test('多行命令逐行回车（CRLF 归一化）', () {
+      final conn = makeConn();
+      final out = <String>[];
+      conn.terminal.onOutput = out.add;
+      conn.sendCommand('conf t\r\nint g0/0\r\nshutdown');
+      expect(out.join(), 'conf t\rint g0/0\rshutdown\r');
+    });
+
+    test('未连接时不发送（守卫）', () {
+      final conn = makeConn(status: ConnStatus.closed);
+      final out = <String>[];
+      conn.terminal.onOutput = out.add;
+      conn.sendCommand('show version');
+      expect(out, isEmpty);
+    });
+
+    test('空白命令不发送', () {
+      final conn = makeConn();
+      final out = <String>[];
+      conn.terminal.onOutput = out.add;
+      conn.sendCommand(' \n\r\n ');
+      expect(out, isEmpty);
+    });
+  });
 }

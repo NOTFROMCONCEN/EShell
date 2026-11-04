@@ -22,6 +22,7 @@ class AiSettings extends ChangeNotifier {
   static const kPrefApiKey = 'eshell.aiApiKey';
   static const kPrefContextLines = 'eshell.aiContextLines';
   static const kPrefReasoningEffort = 'eshell.aiReasoningEffort';
+  static const kPrefAgentMode = 'eshell.aiAgentMode';
 
   String baseUrl = defaultBaseUrl;
   String model = defaultModel;
@@ -31,6 +32,10 @@ class AiSettings extends ChangeNotifier {
   /// 思考强度：'off'（默认，不发送）/ low / medium / high，
   /// 作为 `reasoning_effort` 随请求发送；需要模型支持。
   String reasoningEffort = defaultReasoningEffort;
+
+  /// Agent 自动执行模式：开启后回复中的 ```run 命令块自动写入当前
+  /// 终端（危险命令仍经安全分级确认），并自动继续多步任务。
+  bool agentMode = false;
 
   bool get configured =>
       apiKey.trim().isNotEmpty &&
@@ -52,6 +57,7 @@ class AiSettings extends ChangeNotifier {
     String? apiKey,
     int? contextLines,
     String? reasoningEffort,
+    bool? agentMode,
   }) {
     var changed = false;
     if (baseUrl != null && baseUrl != this.baseUrl) {
@@ -79,8 +85,14 @@ class AiSettings extends ChangeNotifier {
       this.reasoningEffort = reasoningEffort;
       changed = true;
     }
+    if (agentMode != null && agentMode != this.agentMode) {
+      this.agentMode = agentMode;
+      changed = true;
+    }
     if (changed) notifyListeners();
   }
+
+  void setAgentMode(bool value) => update(agentMode: value);
 
   /// 持久化时使用（与 [SecretStore.reveal] 配对）。
   String get encryptedApiKey => SecretStore.protect(apiKey) ?? '';
@@ -93,6 +105,7 @@ class AiSettings extends ChangeNotifier {
     await prefs.setString(kPrefApiKey, encryptedApiKey);
     await prefs.setInt(kPrefContextLines, contextLines);
     await prefs.setString(kPrefReasoningEffort, reasoningEffort);
+    await prefs.setBool(kPrefAgentMode, agentMode);
   }
 
   /// 从磁盘读入设置（AI 子窗口启动时用；键与 [persist] 一致）。
@@ -105,6 +118,7 @@ class AiSettings extends ChangeNotifier {
       contextLines: prefs.getInt(kPrefContextLines) ?? contextLines,
       reasoningEffort:
           prefs.getString(kPrefReasoningEffort) ?? reasoningEffort,
+      agentMode: prefs.getBool(kPrefAgentMode) ?? agentMode,
     );
   }
 }
@@ -114,6 +128,7 @@ class AiChatMessage {
   AiChatMessage({
     required this.role,
     required this.content,
+    this.images = const [],
     this.reasoning = '',
     this.truncated = false,
     this.interrupted = false,
@@ -122,6 +137,9 @@ class AiChatMessage {
 
   final String role; // user / assistant
   String content;
+
+  /// 用户消息附带的图片（多模态；assistant 回复恒为空）。
+  final List<AiImage> images;
 
   /// assistant 的思考过程（reasoning_content 流式累积；可为空）。
   String reasoning;
@@ -159,9 +177,9 @@ class AiChat extends ChangeNotifier {
     notifyListeners();
   }
 
-  void addUser(String text) {
+  void addUser(String text, {List<AiImage> images = const []}) {
     error = null;
-    messages.add(AiChatMessage(role: 'user', content: text));
+    messages.add(AiChatMessage(role: 'user', content: text, images: images));
     notifyListeners();
   }
 
@@ -242,18 +260,38 @@ class AiChat extends ChangeNotifier {
   }
 
   /// 构建请求历史（不含最新的用户问题；由调用方单独传入 prompt）。
-  List<AiMessage> historyForRequest({int maxMessages = 10}) {
+  ///
+  /// [maxMessages] 保留最近 N 条消息；[maxCharsPerMessage] 对单条消息做
+  /// 字符上限截断（UI 保留全文，仅进入请求的历史被压缩）——避免长回复 /
+  /// 工具结果把上下文窗口撑爆导致模型「失忆」。
+  ///
+  /// 图片只在「最近一条带图消息」上保留（多轮追问仍能引用图片），
+  /// 更早的历史图片会被剥离，避免每次请求重复编码多张大图。
+  List<AiMessage> historyForRequest({
+    int maxMessages = 16,
+    int maxCharsPerMessage = 4000,
+  }) {
     final history = messages
         .where((m) => m.role == 'assistant' || m.role == 'user')
-        .where((m) => m.content.trim().isNotEmpty)
+        .where((m) => m.content.trim().isNotEmpty || m.images.isNotEmpty)
         .where((m) => !m.interrupted)
         .toList();
     final recent = history.length > maxMessages
         ? history.sublist(history.length - maxMessages)
         : history;
-    return [
-      for (final m in recent)
-        AiMessage(role: m.role, content: m.content),
-    ];
+    String cap(String content) => content.length <= maxCharsPerMessage
+        ? content
+        : '${content.substring(0, maxCharsPerMessage)}\n…（历史消息过长已截断）';
+    var imagesKept = false;
+    final result = <AiMessage>[];
+    for (final m in recent.reversed) {
+      var images = const <AiImage>[];
+      if (!imagesKept && m.images.isNotEmpty) {
+        images = m.images;
+        imagesKept = true;
+      }
+      result.insert(0, AiMessage(role: m.role, content: cap(m.content), images: images));
+    }
+    return result;
   }
 }

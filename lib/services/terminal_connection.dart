@@ -173,6 +173,23 @@ abstract class TerminalConnection extends ChangeNotifier {
 
   Future<void> reconnect() => connect();
 
+  /// 向会话发送一条命令并回车（AI「发送到终端」入口）。
+  ///
+  /// 经 xterm textInput 通道逐行注入：屏幕回显与手动键入完全一致，
+  /// SSH/Telnet/串口三种传输统一走同一条路；仅在已连接时生效。
+  void sendCommand(String command) {
+    if (status != ConnStatus.connected) return;
+    final normalized =
+        command.trim().replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    if (normalized.isEmpty) return;
+    // 逐行 textInput + \r（回车键等价物）：Telnet 的 NVT 编码按 \r
+    // 转 CR LF，多行命令等价于逐行键入执行。
+    for (final line in normalized.split('\n')) {
+      terminal.textInput(line);
+      terminal.textInput('\r');
+    }
+  }
+
   /// 开始记录会话日志。返回 null 表示成功，否则为错误信息。
   ///
   /// [maskSecrets] 开启时日志写入脱敏后的文本而非原始字节（S2，尽力匹配）。

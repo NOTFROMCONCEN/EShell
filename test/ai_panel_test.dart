@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 
+import 'package:eshell/services/ai_agent.dart';
 import 'package:eshell/services/ai_client.dart';
 import 'package:eshell/state/app_state.dart';
 import 'package:eshell/ui/ai/ai_panel.dart';
@@ -125,7 +127,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // 只读提示与快捷问题入口。
-    expect(find.text('只读分析'), findsOneWidget);
+    expect(find.text('命令需确认执行'), findsOneWidget);
     expect(find.text('分析当前终端'), findsOneWidget);
 
     await tester.tap(find.text('分析当前终端'));
@@ -465,5 +467,309 @@ void main() {
     expect(find.text('端口 up/down'), findsOneWidget);
     expect(find.textContaining('| 层级 |'), findsNothing);
     expect(find.textContaining('|---|'), findsNothing);
+  });
+
+  testWidgets('命令块「发送到终端」：点击后调用 sender 并反馈成功', (tester) async {
+    final app = AppState();
+    app.ai.update(
+      baseUrl: 'http://127.0.0.1:1/v1',
+      model: 'mock',
+      apiKey: 'demo-key',
+    );
+    final fake = _FakeClient([
+      text('执行以下命令查看版本：\n\n```\ndisplay version\n```'),
+    ]);
+    final sent = <String>[];
+
+    await tester.pumpWidget(_wrap(
+      app,
+      AiAssistantPanel(
+        clientFactory: (_) => fake,
+        commandSender: (cmd) async {
+          sent.add(cmd);
+          return null;
+        },
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('分析当前终端'));
+    await tester.pumpAndSettle();
+
+    // 命令块上有发送按钮；点击后命令经用户确认写入终端。
+    await tester.tap(find.byIcon(Icons.play_arrow_rounded));
+    await tester.pumpAndSettle();
+    expect(sent, ['display version']);
+    expect(find.text('命令已发送到当前终端'), findsOneWidget);
+    // 发送成功后按钮变为已发送标记。
+    expect(find.byIcon(Icons.check_rounded), findsOneWidget);
+  });
+
+  testWidgets('命令块发送失败时显示错误文案', (tester) async {
+    final app = AppState();
+    app.ai.update(
+      baseUrl: 'http://127.0.0.1:1/v1',
+      model: 'mock',
+      apiKey: 'demo-key',
+    );
+    final fake = _FakeClient([text('```\ndir\n```')]);
+
+    await tester.pumpWidget(_wrap(
+      app,
+      AiAssistantPanel(
+        clientFactory: (_) => fake,
+        commandSender: (_) async => '当前会话未连接',
+      ),
+    ));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('分析当前终端'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.play_arrow_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('当前会话未连接'), findsOneWidget);
+    expect(find.byIcon(Icons.check_rounded), findsNothing);
+  });
+
+  testWidgets('未注入 commandSender 时不显示发送按钮（只读兜底）', (tester) async {
+    final app = AppState();
+    app.ai.update(
+      baseUrl: 'http://127.0.0.1:1/v1',
+      model: 'mock',
+      apiKey: 'demo-key',
+    );
+    final fake = _FakeClient([text('```\ndir\n```')]);
+
+    await tester.pumpWidget(
+        _wrap(app, AiAssistantPanel(clientFactory: (_) => fake)));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('分析当前终端'));
+    await tester.pumpAndSettle();
+
+    expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
+    expect(find.byIcon(Icons.copy_rounded), findsOneWidget);
+  });
+
+  group('Agent 自动执行模式', () {
+    /// 搭建 Agent 模式面板并发送快捷提问。
+    /// 返回 (fake 调用记录, 已发送命令, AppState)。
+    Future<(List<List<AiMessage>>, List<String>, AppState)> pumpAgent(
+      WidgetTester tester,
+      List<List<AiStreamChunk>> responses, {
+      String? senderError,
+      Future<String> Function()? contextProvider,
+      Future<String> Function()? outputDeltaProvider,
+      Future<String> Function(AgentScanRequest request)? scanProvider,
+      List<AgentScanRequest>? scanCalls,
+    }) async {
+      final app = AppState();
+      app.ai.update(
+        baseUrl: 'http://127.0.0.1:1/v1',
+        model: 'mock',
+        apiKey: 'demo-key',
+        agentMode: true,
+      );
+      final fake = _MultiFake(responses);
+      final sent = <String>[];
+
+      await tester.pumpWidget(_wrap(
+        app,
+        AiAssistantPanel(
+          clientFactory: (_) => fake,
+          contextProvider: contextProvider,
+          outputDeltaProvider: outputDeltaProvider,
+          scanProvider: scanProvider,
+          commandSender: (cmd) async {
+            if (senderError != null) return senderError;
+            sent.add(cmd);
+            return null;
+          },
+        ),
+      ));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分析当前终端'));
+      await tester.pumpAndSettle();
+      // Agent 链路里的输出稳定等待（800ms 定时器）与续步请求。
+      for (var i = 0; i < agentMaxSteps + 1; i++) {
+        await tester.pump(const Duration(milliseconds: 900));
+        await tester.pumpAndSettle();
+      }
+      return (fake.calls, sent, app);
+    }
+
+    testWidgets('scan 块自动执行扫描并回传摘要 → 模型继续', (tester) async {
+      final scanCalls = <AgentScanRequest>[];
+      final (calls, sent, app) = await pumpAgent(
+        tester,
+        [
+          [
+            text('先扫描本机控制台端口：\n\n```scan\n'
+                '{"host":"127.0.0.1","startPort":32768,"endPort":32800}\n```')
+          ],
+          [text('扫描完成，32769 是 Telnet 控制台。')],
+        ],
+        scanProvider: (request) async {
+          scanCalls.add(request);
+          return '32769 → telnet｜\n32770 → silent';
+        },
+      );
+
+      // 扫描能力被透传给 Agent：不发送终端命令，执行扫描。
+      expect(sent, isEmpty);
+      expect(scanCalls, hasLength(1));
+      expect(scanCalls.single.host, '127.0.0.1');
+      expect(scanCalls.single.startPort, 32768);
+      expect(scanCalls.single.endPort, 32800);
+      expect(calls, hasLength(2));
+      expect(
+          app.aiChat.messages
+              .any((m) => m.content.contains('Telnet 扫描结果')),
+          isTrue);
+      expect(
+          app.aiChat.messages.any((m) => m.content.contains('32769 → telnet')),
+          isTrue);
+    });
+
+    testWidgets('scan 块不显示「发送到终端」按钮（不把 JSON 当命令发）',
+        (tester) async {
+      final app = AppState();
+      app.ai.update(
+        baseUrl: 'http://127.0.0.1:1/v1',
+        model: 'mock',
+        apiKey: 'demo-key',
+      );
+      final fake = _FakeClient([
+        text('```scan\n{"host":"127.0.0.1","startPort":32768,"endPort":32800}\n```'),
+      ]);
+
+      await tester.pumpWidget(_wrap(
+        app,
+        AiAssistantPanel(
+          clientFactory: (_) => fake,
+          commandSender: (_) async => null,
+        ),
+      ));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分析当前终端'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Telnet 扫描（自动执行）'), findsOneWidget);
+      expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
+    });
+
+    testWidgets('run 块自动执行 → 回传输出 → 模型继续收尾', (tester) async {
+      final (calls, sent, app) = await pumpAgent(tester, [
+        [text('查看版本。\n\n```run\ndisplay version\n```')],
+        [text('版本信息已确认，巡检完成。')],
+      ]);
+
+      expect(sent, ['display version']);
+      // 两个回合：执行 + 收尾总结。
+      expect(calls, hasLength(2));
+      // 回传给模型的最新请求里带「命令执行结果」与续步指令。
+      expect(calls.last.last.content, contains('命令已执行完毕'));
+      // 对话里能看到执行结果记录与最终结论。
+      expect(
+          app.aiChat.messages
+              .any((m) => m.content.contains('命令执行结果')),
+          isTrue);
+      expect(find.text('版本信息已确认，巡检完成。'), findsOneWidget);
+    });
+
+    testWidgets('危险命令被拦截：不执行、回传拦截说明并继续', (tester) async {
+      final (calls, sent, app) = await pumpAgent(tester, [
+        [text('尝试重启。\n\n```run\nreboot\n```')],
+        [text('已拦截，请手动处理。')],
+      ]);
+
+      expect(sent, isEmpty);
+      expect(calls, hasLength(2));
+      expect(
+          app.aiChat.messages
+              .any((m) => m.content.contains('自动执行被拦截')),
+          isTrue);
+    });
+
+    testWidgets('模型不守协议给普通 bash 块时同样自动执行（回退）', (tester) async {
+      final (calls, sent, app) = await pumpAgent(tester, [
+        [text('采集计划如下。\n\n```bash\ndf -hT\n```\n预期输出：挂载点用量。')],
+        [text('=== 结论 ===\n磁盘正常。')],
+      ]);
+
+      // 回退生效：普通 shell 块也被自动执行。
+      expect(sent, ['df -hT']);
+      expect(calls, hasLength(2));
+      expect(
+          app.aiChat.messages
+              .any((m) => m.content.contains('命令执行结果')),
+          isTrue);
+      expect(find.textContaining('=== 结论 ==='), findsOneWidget);
+    });
+
+    testWidgets('增量输出：工具消息只含命令输出，续步请求不再附带整屏上下文',
+        (tester) async {
+      // 输出增量通道：第一次空（刚发送），随后返回稳定增量。
+      var polls = 0;
+      const deltas = ['', 'output-1\n', 'output-1\n'];
+      Future<String> deltaProvider() async {
+        final text = deltas[polls.clamp(0, deltas.length - 1)];
+        polls++;
+        return text;
+      }
+
+      final (calls, sent, app) = await pumpAgent(
+        tester,
+        [
+          [text('```run\ndf -hT\n```')],
+          [text('=== 结论 ===\n完成。')],
+        ],
+        contextProvider: () async => 'MARKER-CONTEXT-200LINES',
+        outputDeltaProvider: deltaProvider,
+      );
+
+      expect(sent, ['df -hT']);
+      // 首轮请求带完整上下文；续步请求不带（不再重复整屏）。
+      expect(calls.first.last.content, contains('MARKER-CONTEXT-200LINES'));
+      expect(calls.last.last.content,
+          isNot(contains('MARKER-CONTEXT-200LINES')));
+      expect(calls.last.last.content, contains('继续分析'));
+      // 工具消息只含增量输出，不含整屏上下文。
+      final tool = app.aiChat.messages
+          .lastWhere((m) => m.content.contains('命令执行结果'));
+      expect(tool.content, contains('output-1'));
+      expect(tool.content, isNot(contains('MARKER-CONTEXT-200LINES')));
+    });
+
+    testWidgets('步数达到上限自动暂停并提示', (tester) async {
+      final (calls, sent, app) = await pumpAgent(tester, [
+        // 每次都返回同一个 run 块响应（_MultiFake 钳位到最后一份）。
+        [text('```run\ndisplay version\n```')],
+      ]);
+
+      // 初始 1 次 + 11 次续步 = 12 个请求；执行 12 条后暂停。
+      expect(calls, hasLength(agentMaxSteps + 1));
+      expect(sent, hasLength(agentMaxSteps));
+      expect(
+          app.aiChat.messages.any((m) => m.content.contains('步数上限')),
+          isTrue);
+    });
+  });
+
+  testWidgets('用户消息附带图片：气泡内渲染缩略图', (tester) async {
+    // 1x1 透明 PNG（Image.memory 可解码的最小合法图片）。
+    final pngBytes = base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==');
+    final app = AppState();
+    app.aiChat.addUser('这是网络拓扑，请分析',
+        images: [AiImage(mime: 'image/png', bytes: pngBytes)]);
+    app.aiChat.beginAssistant();
+    app.aiChat.appendChunk('收到拓扑，设备为 CE6800-CE + 两台 Ruijie 交换机。');
+    app.aiChat.finishAssistant();
+
+    await tester.pumpWidget(_wrap(app, const AiAssistantPanel()));
+    await tester.pumpAndSettle();
+
+    // 用户气泡里出现图片缩略图与文字。
+    expect(find.byType(Image), findsWidgets);
+    expect(find.text('这是网络拓扑，请分析'), findsOneWidget);
   });
 }

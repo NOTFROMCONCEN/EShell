@@ -829,6 +829,54 @@ class AppState extends ChangeNotifier {
   ConnectionTab? get activeTab =>
       tabs.where((t) => t.id == activeTabId).firstOrNull;
 
+  /// 命令发送前的终端文本快照（Agent 增量输出用）。
+  String? _commandOutputSnapshot;
+
+  /// 把命令发送到当前活动会话（AI「发送到终端」共用入口，主窗口与
+  /// 多窗口宿主都走这里）。返回 null 表示成功，否则为用户可读的错误。
+  String? sendCommandToActiveSession(String command) {
+    final connection = activeTab?.connection;
+    if (connection == null) return '当前没有打开的终端会话';
+    if (connection.status != ConnStatus.connected) return '当前会话未连接';
+    // 发送前快照：之后取增量输出时与它求差。
+    _commandOutputSnapshot = connection.terminal.buffer.getText();
+    connection.sendCommand(command);
+    return null;
+  }
+
+  /// 取「上一次命令发送后」新增的终端输出（Agent 自动执行回传用）。
+  ///
+  /// 只返回增量而非整屏上下文，避免每步把最近 N 行反复灌给模型造成
+  /// token 膨胀；终端缓冲区滚动导致前缀比对失效时按尾部截断兜底。
+  /// 该方法可反复调用做「输出是否稳定」的轮询采样（快照不被清空）。
+  String captureCommandOutputDelta({int maxChars = 6000}) {
+    final connection = activeTab?.connection;
+    if (connection == null) return '（没有活动会话）';
+    final after = connection.terminal.buffer.getText();
+    final before = _commandOutputSnapshot;
+    if (before == null) return _tailText(after.trim(), maxChars);
+
+    final common = _commonPrefixLength(before, after);
+    var delta = after.substring(common).trim();
+    if (delta.isEmpty) return '（无输出）';
+    return _tailText(delta, maxChars);
+  }
+
+  static int _commonPrefixLength(String a, String b) {
+    final n = a.length < b.length ? a.length : b.length;
+    var i = 0;
+    while (i < n && a.codeUnitAt(i) == b.codeUnitAt(i)) {
+      i++;
+    }
+    return i;
+  }
+
+  static String _tailText(String text, int maxChars) {
+    if (text.length <= maxChars) return text;
+    return '…（前 ${text.length - maxChars} 字符已截断）…\n'
+        '${text.substring(text.length - maxChars)}';
+  }
+
   void setActive(String id) {
     activeTabId = id;
     notifyListeners();

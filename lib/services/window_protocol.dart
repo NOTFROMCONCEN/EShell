@@ -45,6 +45,26 @@ class WindowProtocol {
   /// 子→主：AI 设置已在子窗口修改，主窗口从 prefs 重载。
   static const aiSettingsChanged = 'aiSettingsChanged';
 
+  /// 子→主：把 AI 给出的命令发送到主窗口活动会话
+  /// （payload 带 reqId 与 command；主窗口侧执行，命令必须经用户点击确认）。
+  static const aiSendCommand = 'aiSendCommand';
+
+  /// 主→子：发送结果应答（payload 带 reqId；error 非空表示失败原因）。
+  static const aiSendCommandReply = 'aiSendCommandReply';
+
+  /// 子→主：取「上一次命令发送后」的新增终端输出（payload 带 reqId）。
+  static const aiGetOutputDelta = 'aiGetOutputDelta';
+
+  /// 主→子：增量输出应答（payload 带 reqId 与 text）。
+  static const aiOutputDeltaReply = 'aiOutputDeltaReply';
+
+  /// 子→主：请求执行 Telnet 端口扫描（payload 带 reqId 与 host/
+  /// startPort/endPort；Agent ```scan 块）。
+  static const aiTelnetScan = 'aiTelnetScan';
+
+  /// 主→子：扫描摘要应答（payload 带 reqId 与 text）。
+  static const aiTelnetScanReply = 'aiTelnetScanReply';
+
   /// 子→主：子窗口即将真正关闭（X / 收回），主窗口恢复停靠状态并把
   /// 最近备份迁回对话。与 [aiBackupSnapshot] 分离：定期备份只镜像
   /// 数据、绝不能动弹出状态（2026-11-03 修复弹出 3 秒后被重置、

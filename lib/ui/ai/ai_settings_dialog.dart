@@ -40,6 +40,7 @@ class _AiSettingsDialogState extends State<_AiSettingsDialog> {
   late final TextEditingController _apiKey;
   late int _contextLines;
   late String _reasoningEffort;
+  late bool _agentMode;
 
   bool _obscureKey = true;
   bool _testing = false;
@@ -60,6 +61,7 @@ class _AiSettingsDialogState extends State<_AiSettingsDialog> {
     _apiKey = TextEditingController(text: ai.apiKey);
     _contextLines = ai.contextLines;
     _reasoningEffort = ai.reasoningEffort;
+    _agentMode = ai.agentMode;
   }
 
   @override
@@ -75,7 +77,8 @@ class _AiSettingsDialogState extends State<_AiSettingsDialog> {
     ..model = _model.text.trim()
     ..apiKey = _apiKey.text.trim()
     ..contextLines = _contextLines
-    ..reasoningEffort = _reasoningEffort;
+    ..reasoningEffort = _reasoningEffort
+    ..agentMode = _agentMode;
 
   Future<void> _testConnection() async {
     final draft = _draft;
@@ -176,7 +179,7 @@ class _AiSettingsDialogState extends State<_AiSettingsDialog> {
                 child: Text(
                   '支持任意 OpenAI 兼容接口（默认 DeepSeek）。'
                   '每次提问会把「当前会话最近 N 行终端输出 + 你的问题」发送到该服务，'
-                  'AI 只做分析、不会执行命令。API Key 在 Windows 上经 DPAPI 加密后本机保存。',
+                  'AI 只做分析，命令经你确认后才会发送到终端。API Key 在 Windows 上经 DPAPI 加密后本机保存。',
                   style: textTheme.bodySmall
                       ?.copyWith(color: scheme.onSurfaceVariant, height: 1.5),
                 ),
@@ -261,6 +264,21 @@ class _AiSettingsDialogState extends State<_AiSettingsDialog> {
                   _reasoningEffort == 'off'
                       ? '关闭时不发送该参数；开启后模型会先思考再回答（返回思考过程，可折叠查看）。'
                       : '以 reasoning_effort=${_reasoningEffort.toLowerCase()} 随请求发送，需要模型支持；不支持时请选「关闭」。',
+                  style: textTheme.bodySmall
+                      ?.copyWith(color: scheme.onSurfaceVariant),
+                ),
+              ),
+              const Divider(height: 24),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                value: _agentMode,
+                onChanged: (v) => setState(() => _agentMode = v),
+                title: const Text('Agent 自动执行模式'),
+                subtitle: Text(
+                  '回复中的 ```run 代码块将自动写入当前终端并回传输出（多步任务）。'
+                  '重启/清配置/格式化/递归删除等高危命令仍会弹窗确认，'
+                  '其余命令不再逐条确认，请仅在可信设备上开启。',
                   style: textTheme.bodySmall
                       ?.copyWith(color: scheme.onSurfaceVariant),
                 ),

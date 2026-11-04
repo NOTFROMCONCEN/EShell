@@ -21,7 +21,7 @@ class AiPanelToggle extends StatelessWidget {
           ? 'AI 助手在独立窗口（点击收回并隐藏）'
           : open
               ? '隐藏 AI 助手'
-              : 'AI 助手（只读分析）',
+              : 'AI 助手（命令需确认执行）',
       iconSize: size,
       icon: Icon(
         open || poppedOut ? Icons.auto_awesome : Icons.auto_awesome_outlined,

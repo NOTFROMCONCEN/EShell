@@ -1,8 +1,11 @@
+import 'dart:typed_data';
+
 import 'package:eshell/services/ai_client.dart';
 import 'package:eshell/services/ai_prompt.dart';
 import 'package:eshell/services/secret_store.dart';
 import 'package:eshell/state/ai_state.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   group('AiSettings', () {
@@ -11,6 +14,20 @@ void main() {
       expect(settings.configured, isFalse);
       settings.update(apiKey: 'demo-key');
       expect(settings.configured, isTrue);
+    });
+
+    test('agentMode 默认关闭，持久化往返一致', () async {
+      SharedPreferences.setMockInitialValues({});
+      final settings = AiSettings();
+      await settings.loadFromDisk();
+      expect(settings.agentMode, isFalse);
+      settings.setAgentMode(true);
+      await settings.persist();
+      final reloaded = AiSettings();
+      await reloaded.loadFromDisk();
+      expect(reloaded.agentMode, isTrue);
+      reloaded.setAgentMode(false);
+      expect(reloaded.agentMode, isFalse);
     });
 
     test('update 去空白并夹取上下文行数', () {
@@ -172,11 +189,103 @@ void main() {
         history: const [AiMessage(role: 'user', content: '旧问题')],
       );
       expect(messages.first.role, 'system');
-      expect(messages.first.content, contains('只读'));
+      // 安全约定：AI 不自行执行，命令经用户确认后发送到终端。
+      expect(messages.first.content, contains('不能自行执行'));
+      expect(messages.first.content, contains('发送到当前终端'));
+      // 非 Agent 模式不含 run 块自动执行说明。
+      expect(messages.first.content, isNot(contains('Agent 自动执行模式')));
+    });
+
+    test('buildAiMessages 空上下文时不拼接上下文段（Agent 续步）', () {
+      final messages = buildAiMessages(
+        context: '',
+        prompt: '继续执行下一步',
+        agentMode: true,
+      );
+      // 无上下文段与分隔符，只有纯提示词。
+      expect(messages.last.content, '继续执行下一步');
+      expect(messages.last.content, isNot(contains('--- 用户问题 ---')));
+    });
+
+    test('historyForRequest 保留最近 16 条并截断超长消息', () {
+      final chat = AiChat();
+      for (var i = 0; i < 20; i++) {
+        chat.messages.add(AiChatMessage(
+          role: i.isEven ? 'user' : 'assistant',
+          content: 'm$i',
+        ));
+      }
+      chat.messages
+          .add(AiChatMessage(role: 'user', content: 'x' * 5000));
+
+      final history = chat.historyForRequest();
+      // 窗口从 10 扩到 16：Agent 多步执行时原始任务不易被挤出。
+      expect(history, hasLength(16));
+      // 最新消息保留，最早的消息被裁掉。
+      expect(history.any((m) => m.content == 'm19'), isTrue);
+      expect(history.any((m) => m.content == 'm0'), isFalse);
+      // 超长消息截断并标注（UI 全文不受影响）。
+      expect(history.last.content.length, lessThanOrEqualTo(4100));
+      expect(history.last.content, contains('历史消息过长已截断'));
+    });
+
+    test('buildAiMessages agentMode 追加 Agent 自动执行说明', () {
+      final messages = buildAiMessages(
+        context: '终端上下文',
+        prompt: '巡检',
+        history: const [AiMessage(role: 'user', content: '旧问题')],
+        agentMode: true,
+      );
+      expect(messages.first.content, contains('Agent 自动执行模式'));
+      expect(messages.first.content, contains('```run'));
+      expect(messages.first.content, contains('不能自行执行'));
       expect(messages[1].content, '旧问题');
       expect(messages.last.role, 'user');
       expect(messages.last.content, contains('终端上下文'));
-      expect(messages.last.content, contains('问题'));
+      expect(messages.last.content, contains('巡检'));
+    });
+  });
+
+  group('图片附件（多模态）', () {
+    AiImage png([int seed = 1]) => AiImage(
+        mime: 'image/png', bytes: Uint8List.fromList([seed, 2, 3]));
+
+    test('addUser 保存图片附件，历史保留最近一条带图消息', () {
+      final chat = AiChat();
+      chat.addUser('第一张图', images: [png(1)]);
+      chat.beginAssistant();
+      chat.appendChunk('ok');
+      chat.finishAssistant();
+      chat.addUser('第二张图', images: [png(2)]);
+      chat.beginAssistant();
+      chat.appendChunk('ok');
+      chat.finishAssistant();
+
+      final history = chat.historyForRequest();
+      // 只有最近一条带图消息保留图片（之前的图片被剥离，控制请求体量）。
+      final withImages = history.where((m) => m.images.isNotEmpty).toList();
+      expect(withImages, hasLength(1));
+      expect(withImages.single.content, '第二张图');
+      expect(withImages.single.images.single.bytes.first, 2);
+    });
+
+    test('纯图片消息（无文字）也进入历史', () {
+      final chat = AiChat();
+      chat.addUser('请结合附图分析。', images: [png(9)]);
+      final history = chat.historyForRequest();
+      expect(history, hasLength(1));
+      expect(history.single.images, hasLength(1));
+    });
+
+    test('buildAiMessages 把本次提问图片挂在最后一条 user 消息上', () {
+      final messages = buildAiMessages(
+        context: '',
+        prompt: '看拓扑',
+        promptImages: [png(7)],
+      );
+      expect(messages.last.role, 'user');
+      expect(messages.last.images, hasLength(1));
+      expect(messages.last.images.single.bytes.first, 7);
     });
   });
 }

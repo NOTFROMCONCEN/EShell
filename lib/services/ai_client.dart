@@ -1,15 +1,47 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+
+/// 图片附件（多模态消息用；统一压缩后的 PNG/JPEG 字节）。
+class AiImage {
+  const AiImage({required this.mime, required this.bytes});
+
+  final String mime;
+  final Uint8List bytes;
+}
 
 /// 一条对话消息（OpenAI chat 格式）。
+///
+/// 带图片时 content 序列化为多模态数组：
+/// `[{"type":"text","text":...},{"type":"image_url","image_url":{"url":"data:..."}}]`。
 class AiMessage {
-  const AiMessage({required this.role, required this.content});
+  const AiMessage({
+    required this.role,
+    required this.content,
+    this.images = const [],
+  });
 
   final String role; // system / user / assistant
   final String content;
+  final List<AiImage> images;
 
-  Map<String, dynamic> toJson() => {'role': role, 'content': content};
+  Map<String, dynamic> toJson() {
+    if (images.isEmpty) return {'role': role, 'content': content};
+    return {
+      'role': role,
+      'content': [
+        {'type': 'text', 'text': content},
+        for (final image in images)
+          {
+            'type': 'image_url',
+            'image_url': {
+              'url': 'data:${image.mime};base64,${base64Encode(image.bytes)}',
+            },
+          },
+      ],
+    };
+  }
 }
 
 /// AI 请求失败（错误信息可直接展示给用户）。

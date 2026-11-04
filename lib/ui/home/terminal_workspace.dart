@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import 'package:xterm/xterm.dart';
 
 import '../../models/session.dart';
+import '../../services/ai_agent.dart';
 import '../../services/serial_connection.dart';
 import '../../services/terminal_connection.dart';
 import '../../state/app_state.dart';
@@ -78,6 +79,11 @@ class TerminalWorkspace extends StatelessWidget {
                         onPopOut: host == null ? null : () => host.popOutAi(),
                         sessionNameProvider: () =>
                             app.activeTab?.connection.session.displayName ?? '',
+                        commandSender: (command) async =>
+                            app.sendCommandToActiveSession(command),
+                        outputDeltaProvider: () async =>
+                            app.captureCommandOutputDelta(),
+                        scanProvider: runTelnetScanForAgent,
                       ),
               ),
             ],
