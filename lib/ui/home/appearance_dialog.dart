@@ -154,6 +154,37 @@ class _AppearanceDialog extends StatelessWidget {
                 onSelectionChanged: (v) => settings.setUiTextScale(v.first),
               ),
               const Divider(),
+              Padding(
+                padding: const EdgeInsets.only(left: 4, bottom: 8),
+                child: Text('整体界面缩放',
+                    style: Theme.of(context)
+                        .textTheme
+                        .labelLarge
+                        ?.copyWith(color: scheme.onSurfaceVariant)),
+              ),
+              SegmentedButton<double>(
+                segments: const [
+                  ButtonSegment(value: 0.75, label: Text('75%')),
+                  ButtonSegment(value: 0.8, label: Text('80%')),
+                  ButtonSegment(value: 0.9, label: Text('90%')),
+                  ButtonSegment(value: 1.0, label: Text('100%')),
+                ],
+                selected: {settings.uiScale},
+                onSelectionChanged: (v) => settings.setUiScale(v.first),
+                showSelectedIcon: false,
+              ),
+              Padding(
+                padding: const EdgeInsets.only(left: 4, top: 8),
+                child: Text(
+                  '整屏等比缩放（文字、图标、间距一起缩小），默认 90%（比系统缩放小一号）；'
+                  '终端字号可在上方单独调节。',
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodySmall
+                      ?.copyWith(color: scheme.onSurfaceVariant),
+                ),
+              ),
+              const Divider(),
               // S2：会话日志脱敏开关（默认关闭，保持原始字节保真）。
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
@@ -204,14 +235,14 @@ class _SeedSwatch extends StatelessWidget {
       message: label,
       child: InkWell(
         onTap: onTap,
-        customBorder: const CircleBorder(),
+        customBorder:
+            const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 150),
           width: 40,
           height: 40,
           decoration: BoxDecoration(
             color: color,
-            shape: BoxShape.circle,
             border: Border.fromBorderSide(
               selected
                   ? BorderSide(color: scheme.primary, width: 3)

@@ -78,6 +78,7 @@ abstract class TerminalConnection extends ChangeNotifier {
   /// [connect] 的重入守卫会把「首次连接」误判为「连接进行中」直接拦下，
   /// 表现为永远卡在正在连接（2026-10-27 回归修复）。
   bool _connectStarted = false;
+  int _connectionGeneration = 0;
 
   /// 会话日志状态：把远端输出写入本地文件。
   bool logging = false;
@@ -98,6 +99,7 @@ abstract class TerminalConnection extends ChangeNotifier {
       return;
     }
     _connectStarted = true;
+    final generation = ++_connectionGeneration;
     status = ConnStatus.connecting;
     error = null;
     hostKeyMismatch = null;
@@ -106,11 +108,19 @@ abstract class TerminalConnection extends ChangeNotifier {
 
     try {
       await performConnect();
+      if (generation != _connectionGeneration) {
+        await performTeardown();
+        return;
+      }
       statusDetail = null;
       status = ConnStatus.connected;
       connectedAt = DateTime.now();
       // lastConnectedAt 由 AppState 监听连接状态后 upsert 副本更新（M3）。
     } catch (e) {
+      if (generation != _connectionGeneration) {
+        await performTeardown();
+        return;
+      }
       // 指纹阻断路径已设置 error，异常文本不再覆盖。
       error ??= e.toString();
       statusDetail = null;
@@ -154,11 +164,10 @@ abstract class TerminalConnection extends ChangeNotifier {
 
   /// 本地主动断开：停日志 → 释放通道 → 状态流转。
   Future<void> disconnect() async {
+    ++_connectionGeneration;
+    status = ConnStatus.closed;
     await _stopLoggingInternal();
     await performTeardown();
-    if (status != ConnStatus.closed) {
-      status = ConnStatus.closed;
-    }
     notifyListeners();
   }
 
@@ -178,9 +187,12 @@ abstract class TerminalConnection extends ChangeNotifier {
       final sink = file.openWrite(
         mode: await file.exists() ? FileMode.append : FileMode.write,
       );
-      final target = session.transport == SessionTransport.serial
-          ? '串口 ${session.address}'
-          : '${session.username}@${session.host}:${session.port}';
+      final target = switch (session.transport) {
+        SessionTransport.serial => '串口 ${session.address}',
+        SessionTransport.telnet => 'telnet ${session.host}:${session.port}',
+        SessionTransport.ssh =>
+          '${session.username}@${session.host}:${session.port}',
+      };
       sink.writeln('===== EShell 会话日志 · '
           '${session.displayName} · $target · '
           '开始于 ${formatTimestamp(DateTime.now())}'

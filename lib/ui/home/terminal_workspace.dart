@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -9,39 +11,158 @@ import '../../services/terminal_connection.dart';
 import '../../state/app_state.dart';
 import '../../theme/app_theme.dart';
 import '../../utils/format.dart';
+import '../ai/ai_panel.dart';
+import '../ai/ai_toggle_button.dart';
+import '../common/resizer.dart';
 import '../session/quick_connect_dialog.dart';
 import '../session/session_edit_dialog.dart';
 import '../session/session_log.dart';
+import '../session/telnet_scan_dialog.dart';
+import '../settings/settings_page.dart';
 
-/// 右侧终端工作区：标签条 + 终端面板 / 空状态引导。
+/// 右侧终端工作区：标签条 + 终端面板 / 空状态引导（+ 可选的 AI 助手侧栏）。
 class TerminalWorkspace extends StatelessWidget {
   const TerminalWorkspace({super.key});
+
+  /// AI 面板加宽时给终端区保留的最小宽度。
+  static const double _minTerminalWidth = 320;
 
   @override
   Widget build(BuildContext context) {
     final app = context.watch<AppState>();
+    final settings = app.settings;
+    // 空状态页的「恢复侧边栏」按钮、标签条上的侧栏开关直接读 ThemeSettings；
+    // settings 的通知已由 AppState.load() 桥接给 AppState，watch 即可同步重建。
+    final content = app.tabs.isEmpty
+        ? const _EmptyWorkspace()
+        : _buildTabbedWorkspace(context, app);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 面板宽度受三重约束：硬边界 [280, 800] + 窗口可用宽度（保住终端区）。
+        // 窗口被调窄后持久化的旧宽度也在这里被夹回，避免把终端挤没。
+        final maxPanelWidth = math.max(
+          ThemeSettings.minAiPanelWidth,
+          math.min(
+            ThemeSettings.maxAiPanelWidth,
+            constraints.maxWidth - _minTerminalWidth,
+          ),
+        );
+        final panelWidth = settings.aiPanelWidth.clamp(
+          ThemeSettings.minAiPanelWidth,
+          maxPanelWidth,
+        );
+        final host = app.windowHost;
+        final aiPoppedOut = host?.aiPoppedOut ?? false;
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(child: content),
+            if (settings.showAiPanel) ...[
+              PanelResizer(
+                tooltip: '拖动调整 AI 面板宽度 · 双击恢复默认',
+                onDrag: (d) => settings.setAiPanelWidth(
+                  (settings.aiPanelWidth - d).clamp(
+                    ThemeSettings.minAiPanelWidth,
+                    math.min(ThemeSettings.maxAiPanelWidth, maxPanelWidth),
+                  ),
+                ),
+                onDoubleTap: () =>
+                    settings.setAiPanelWidth(ThemeSettings.defaultAiPanelWidth),
+              ),
+              SizedBox(
+                width: panelWidth,
+                // AI 已弹出：占位卡保留宽度区，收回后无缝回到停靠面板。
+                child: aiPoppedOut
+                    ? _AiPoppedPlaceholder(onDock: host!.dockAi)
+                    : AiAssistantPanel(
+                        onPopOut: host == null ? null : () => host.popOutAi(),
+                        sessionNameProvider: () =>
+                            app.activeTab?.connection.session.displayName ?? '',
+                      ),
+              ),
+            ],
+          ],
+        );
+      },
+    );
+  }
 
-    if (app.tabs.isEmpty) {
-      return const _EmptyWorkspace();
-    }
-    final activeIndex =
-        app.tabs.indexWhere((t) => t.id == app.activeTabId).clamp(0, app.tabs.length - 1);
+  Widget _buildTabbedWorkspace(BuildContext context, AppState app) {
+    final activeIndex = app.tabs
+        .indexWhere((t) => t.id == app.activeTabId)
+        .clamp(0, app.tabs.length - 1);
     final activeId = app.tabs[activeIndex].id;
 
     return Column(
       children: [
         _TabStrip(tabs: app.tabs, activeId: activeId),
         Divider(
-            height: 1, thickness: 1, color: Theme.of(context).colorScheme.outlineVariant),
+          height: 1,
+          thickness: 1,
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
         Expanded(
           child: IndexedStack(
             index: activeIndex,
             // C4：把「是否活动」下发到 pane，pane 在变为活动时自请焦点。
-            children:
-                app.tabs.map((t) => _TerminalPane(tab: t, active: t.id == activeId)).toList(),
+            children: app.tabs
+                .map((t) => _TerminalPane(tab: t, active: t.id == activeId))
+                .toList(),
           ),
         ),
       ],
+    );
+  }
+}
+
+/// AI 面板已弹出为独立窗口时的占位卡。
+class _AiPoppedPlaceholder extends StatelessWidget {
+  const _AiPoppedPlaceholder({required this.onDock});
+
+  final VoidCallback onDock;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    return Material(
+      color: scheme.surface,
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.auto_awesome,
+              size: 40,
+              color: scheme.primary.withValues(alpha: 0.7),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'AI 助手已在独立窗口运行',
+              textAlign: TextAlign.center,
+              style: textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '对话仍与主窗口实时同步，关闭独立窗口或点下方按钮即可收回。',
+              textAlign: TextAlign.center,
+              style: textTheme.bodySmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+                height: 1.5,
+              ),
+            ),
+            const SizedBox(height: 20),
+            FilledButton.tonalIcon(
+              onPressed: onDock,
+              icon: const Icon(Icons.dock_rounded, size: 18),
+              label: const Text('收回 AI 面板'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -75,6 +196,12 @@ class _TabStrip extends StatelessWidget {
             const _LogToggle(),
             const SizedBox(width: 4),
             const _FontSizeControls(),
+            const AiPanelToggle(),
+            IconButton(
+              tooltip: '程序设置',
+              icon: const Icon(Icons.settings_outlined),
+              onPressed: () => showSettingsPage(context),
+            ),
             IconButton(
               tooltip: '快速连接',
               icon: const Icon(Icons.add),
@@ -102,9 +229,7 @@ class _SidebarToggle extends StatelessWidget {
           ? '隐藏侧边栏 (Ctrl+Shift+B)'
           : '显示侧边栏 (Ctrl+Shift+B)',
       icon: Icon(
-        settings.showSidebar
-            ? Icons.menu_open_outlined
-            : Icons.menu_outlined,
+        settings.showSidebar ? Icons.menu_open_outlined : Icons.menu_outlined,
         size: 20,
       ),
       onPressed: () => settings.setShowSidebar(!settings.showSidebar),
@@ -118,23 +243,22 @@ String _tabTooltip(ConnectionTab tab) {
   final address = conn.session.address;
   return switch (conn.status) {
     ConnStatus.connecting => [
-        '正在连接 $address',
-        if (conn.statusDetail != null) conn.statusDetail!,
-      ].join('\n'),
+      '正在连接 $address',
+      if (conn.statusDetail != null) conn.statusDetail!,
+    ].join('\n'),
     ConnStatus.connected => () {
-        final at = conn.connectedAt;
-        final connectedLine =
-            at == null ? null : '已连接于 ${formatTimestamp(at)}';
-        final fp = conn.hostFingerprint;
-        // 串口自动探测：展示探测到的实际波特率。
-        final actualBaud = conn is SerialConnection ? conn.detectedBaud : null;
-        return [
-          address,
-          if (actualBaud != null) '实际波特率 $actualBaud bps',
-          if (connectedLine != null) connectedLine,
-          if (fp != null) '主机密钥 $fp',
-        ].join('\n');
-      }(),
+      final at = conn.connectedAt;
+      final connectedLine = at == null ? null : '已连接于 ${formatTimestamp(at)}';
+      final fp = conn.hostFingerprint;
+      // 串口自动探测：展示探测到的实际波特率。
+      final actualBaud = conn is SerialConnection ? conn.detectedBaud : null;
+      return [
+        address,
+        if (actualBaud != null) '实际波特率 $actualBaud bps',
+        if (connectedLine != null) connectedLine,
+        if (fp != null) '主机密钥 $fp',
+      ].join('\n');
+    }(),
     ConnStatus.failed => '连接失败 · $address\n${conn.error ?? ''}',
     ConnStatus.closed => '连接已关闭 · $address',
   };
@@ -153,11 +277,13 @@ class _LogToggle extends StatelessWidget {
       if (context.mounted) {
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(
-            content: Text('会话日志已停止并保存'),
-            behavior: SnackBarBehavior.floating,
-            width: 360,
-          ));
+          ..showSnackBar(
+            const SnackBar(
+              content: Text('会话日志已停止并保存'),
+              behavior: SnackBarBehavior.floating,
+              width: 360,
+            ),
+          );
       }
     } else {
       await startLoggingWithDialog(context, app.settings, conn);
@@ -176,8 +302,8 @@ class _LogToggle extends StatelessWidget {
       tooltip: logging
           ? '停止记录日志\n${conn?.logPath ?? ''}'
           : connected
-              ? '记录会话日志（选择保存位置和文件名）'
-              : '记录会话日志（仅已连接的会话可用）',
+          ? '记录会话日志（选择保存位置和文件名）'
+          : '记录会话日志（仅已连接的会话可用）',
       icon: Icon(
         logging ? Icons.description_rounded : Icons.description_outlined,
         size: 20,
@@ -213,9 +339,9 @@ class _FontSizeControls extends StatelessWidget {
                 settings.terminalFontSize.toStringAsFixed(0),
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: scheme.onSurfaceVariant,
-                      fontFeatures: [const FontFeature.tabularFigures()],
-                    ),
+                  color: scheme.onSurfaceVariant,
+                  fontFeatures: [const FontFeature.tabularFigures()],
+                ),
               ),
             ),
           ),
@@ -247,15 +373,21 @@ class _TabChip extends StatelessWidget {
         message: _tabTooltip(tab),
         waitDuration: const Duration(milliseconds: 400),
         child: InkWell(
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.zero,
           onTap: () => app.setActive(tab.id),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 150),
             padding: const EdgeInsetsDirectional.only(start: 12, end: 4),
             height: double.infinity,
             decoration: BoxDecoration(
-              color: selected ? scheme.surfaceContainerHigh : Colors.transparent,
-              borderRadius: BorderRadius.circular(10),
+              color: selected
+                  ? scheme.surfaceContainerHigh
+                  : Colors.transparent,
+              borderRadius: BorderRadius.zero,
+              border: Border.all(
+                color: selected ? scheme.primary : scheme.outlineVariant,
+                width: 1,
+              ),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
@@ -269,18 +401,26 @@ class _TabChip extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                          color: selected ? scheme.onSurface : scheme.onSurfaceVariant,
-                          fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                        ),
+                      color: selected
+                          ? scheme.onSurface
+                          : scheme.onSurfaceVariant,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                    ),
                   ),
                 ),
                 const SizedBox(width: 4),
                 InkWell(
-                  customBorder: const CircleBorder(),
+                  customBorder: const RoundedRectangleBorder(
+                    borderRadius: BorderRadius.zero,
+                  ),
                   onTap: () => app.closeTab(tab.id),
                   child: Padding(
                     padding: const EdgeInsets.all(4),
-                    child: Icon(Icons.close, size: 14, color: scheme.onSurfaceVariant),
+                    child: Icon(
+                      Icons.close,
+                      size: 14,
+                      color: scheme.onSurfaceVariant,
+                    ),
                   ),
                 ),
               ],
@@ -339,8 +479,9 @@ class _TerminalPane extends StatefulWidget {
 }
 
 class _TerminalPaneState extends State<_TerminalPane> {
-  late final FocusNode _focusNode =
-      FocusNode(debugLabel: 'terminal-${widget.tab.id}');
+  late final FocusNode _focusNode = FocusNode(
+    debugLabel: 'terminal-${widget.tab.id}',
+  );
 
   TerminalStyle? _cachedStyle;
   double? _cachedStyleFontSize;
@@ -376,7 +517,10 @@ class _TerminalPaneState extends State<_TerminalPane> {
   /// Ctrl+Shift+B 显示/隐藏侧边栏。
   /// 这些组合未被 xterm 按键表映射，会从终端焦点向上冒泡到这里。
   static KeyEventResult _onZoomKey(
-      FocusNode node, KeyEvent event, ThemeSettings settings) {
+    FocusNode node,
+    KeyEvent event,
+    ThemeSettings settings,
+  ) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (!HardwareKeyboard.instance.isControlPressed) {
       return KeyEventResult.ignored;
@@ -397,8 +541,7 @@ class _TerminalPaneState extends State<_TerminalPane> {
       settings.bumpTerminalFontSize(-1);
       return KeyEventResult.handled;
     }
-    if (key == LogicalKeyboardKey.digit0 ||
-        key == LogicalKeyboardKey.numpad0) {
+    if (key == LogicalKeyboardKey.digit0 || key == LogicalKeyboardKey.numpad0) {
       settings.resetTerminalFontSize();
       return KeyEventResult.handled;
     }
@@ -499,7 +642,6 @@ class _HostKeyOverlay extends StatelessWidget {
 
     return Center(
       child: Card(
-        elevation: 3,
         child: Container(
           constraints: const BoxConstraints(maxWidth: 520),
           padding: const EdgeInsets.all(28),
@@ -512,8 +654,10 @@ class _HostKeyOverlay extends StatelessWidget {
                   Icon(Icons.gpp_maybe_outlined, color: scheme.error),
                   const SizedBox(width: 10),
                   Expanded(
-                    child: Text('主机公钥指纹已变化',
-                        style: Theme.of(context).textTheme.titleMedium),
+                    child: Text(
+                      '主机公钥指纹已变化',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
                   ),
                 ],
               ),
@@ -522,9 +666,7 @@ class _HostKeyOverlay extends StatelessWidget {
                 '${mismatch.host}:${mismatch.port} 的 ${mismatch.keyType} '
                 '指纹与首次连接时的记录不一致。若服务器近期重装过系统属于正常；'
                 '否则可能存在中间人攻击，请勿盲目更新。',
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
+                style: Theme.of(context).textTheme.bodySmall
                     ?.copyWith(color: scheme.onSurfaceVariant, height: 1.5),
               ),
               const SizedBox(height: 12),
@@ -533,22 +675,28 @@ class _HostKeyOverlay extends StatelessWidget {
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: scheme.surfaceContainerHigh,
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.zero,
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('已记录：${mismatch.storedFingerprint}',
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontFamily: 'Consolas',
-                            color: scheme.onSurfaceVariant)),
+                    Text(
+                      '已记录：${mismatch.storedFingerprint}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'Consolas',
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
                     const SizedBox(height: 6),
-                    Text('本次连接：${mismatch.actualFingerprint}',
-                        style: TextStyle(
-                            fontSize: 12,
-                            fontFamily: 'Consolas',
-                            color: scheme.error)),
+                    Text(
+                      '本次连接：${mismatch.actualFingerprint}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'Consolas',
+                        color: scheme.error,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -557,8 +705,8 @@ class _HostKeyOverlay extends StatelessWidget {
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   TextButton(
-                    onPressed: () => app
-                        .closeTab(AppState.tabIdOf(conn.session.id)),
+                    onPressed: () =>
+                        app.closeTab(AppState.tabIdOf(conn.session.id)),
                     child: const Text('关闭标签'),
                   ),
                   const SizedBox(width: 8),
@@ -592,7 +740,6 @@ class _ConnectingOverlay extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Center(
       child: Card(
-        elevation: 3,
         child: Padding(
           padding: const EdgeInsets.all(28),
           child: Column(
@@ -600,18 +747,22 @@ class _ConnectingOverlay extends StatelessWidget {
             children: [
               const CircularProgressIndicator(strokeWidth: 3),
               const SizedBox(height: 20),
-              Text('正在连接 ${conn.session.address}',
-                  style: Theme.of(context).textTheme.titleSmall),
+              Text(
+                '正在连接 ${conn.session.address}',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
               const SizedBox(height: 6),
               Text(
                 conn.statusDetail ??
-                    (conn.session.transport == SessionTransport.serial
-                        ? '打开串口 ${conn.session.host}'
-                        : '用户 ${conn.session.username} · 正在协商加密通道'),
+                    switch (conn.session.transport) {
+                      SessionTransport.serial => '打开串口 ${conn.session.host}',
+                      SessionTransport.telnet =>
+                        'Telnet 控制台 ${conn.session.host}:${conn.session.port} · 正在建立连接',
+                      SessionTransport.ssh =>
+                        '用户 ${conn.session.username} · 正在协商加密通道',
+                    },
                 textAlign: TextAlign.center,
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
+                style: Theme.of(context).textTheme.bodySmall
                     ?.copyWith(color: scheme.onSurfaceVariant),
               ),
             ],
@@ -633,7 +784,6 @@ class _FailedOverlay extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Center(
       child: Card(
-        elevation: 3,
         child: Container(
           constraints: const BoxConstraints(maxWidth: 480),
           padding: const EdgeInsets.all(28),
@@ -645,8 +795,7 @@ class _FailedOverlay extends StatelessWidget {
                 children: [
                   Icon(Icons.error_outline, color: scheme.error),
                   const SizedBox(width: 10),
-                  Text('连接失败',
-                      style: Theme.of(context).textTheme.titleMedium),
+                  Text('连接失败', style: Theme.of(context).textTheme.titleMedium),
                 ],
               ),
               const SizedBox(height: 12),
@@ -655,12 +804,15 @@ class _FailedOverlay extends StatelessWidget {
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: scheme.errorContainer.withValues(alpha: 0.5),
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.zero,
                 ),
                 child: Text(
                   conn.error ?? '未知错误',
                   style: TextStyle(
-                      color: scheme.onErrorContainer, fontSize: 13, height: 1.4),
+                    color: scheme.onErrorContainer,
+                    fontSize: 13,
+                    height: 1.4,
+                  ),
                 ),
               ),
               const SizedBox(height: 20),
@@ -697,14 +849,16 @@ class _ClosedOverlay extends StatelessWidget {
   Widget build(BuildContext context) {
     return Center(
       child: Card(
-        elevation: 3,
         child: Padding(
           padding: const EdgeInsets.all(28),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.link_off_outlined,
-                  size: 32, color: Theme.of(context).colorScheme.onSurfaceVariant),
+              Icon(
+                Icons.link_off_outlined,
+                size: 32,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
               const SizedBox(height: 12),
               Text('连接已关闭', style: Theme.of(context).textTheme.titleSmall),
               const SizedBox(height: 20),
@@ -731,10 +885,15 @@ class _EmptyWorkspace extends StatelessWidget {
 
     final recent = [...app.sessions]
       ..where((s) => s.lastConnectedAt != null).toList()
-      ..sort((a, b) => (b.lastConnectedAt ?? DateTime(2000))
-          .compareTo(a.lastConnectedAt ?? DateTime(2000)));
-    final recentSessions =
-        recent.where((s) => s.lastConnectedAt != null).take(6).toList();
+      ..sort(
+        (a, b) => (b.lastConnectedAt ?? DateTime(2000)).compareTo(
+          a.lastConnectedAt ?? DateTime(2000),
+        ),
+      );
+    final recentSessions = recent
+        .where((s) => s.lastConnectedAt != null)
+        .take(6)
+        .toList();
 
     // 侧边栏隐藏 + 无标签时，标签条不存在，这里提供恢复入口。
     return Stack(
@@ -750,78 +909,113 @@ class _EmptyWorkspace extends StatelessWidget {
                   app.settings.setShowSidebar(!app.settings.showSidebar),
             ),
           ),
+        if (!app.settings.showSidebar)
+          Positioned(
+            top: 8,
+            right: 8,
+            child: IconButton(
+              tooltip: '程序设置',
+              icon: const Icon(Icons.settings_outlined, size: 20),
+              onPressed: () => showSettingsPage(context),
+            ),
+          ),
         Center(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(40),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-            Container(
-              width: 148,
-              height: 148,
-              decoration: BoxDecoration(
-                color: scheme.surfaceContainerHigh,
-                shape: BoxShape.circle,
-              ),
-              alignment: Alignment.center,
-              child: Icon(Icons.terminal_rounded,
-                  size: 68, color: scheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 28),
-            Text('欢迎使用 EShell',
-                style: Theme.of(context)
-                    .textTheme
-                    .headlineSmall
-                    ?.copyWith(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            Text(
-              '一个秉承 Material You 设计的 SSH 终端',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyLarge
-                  ?.copyWith(color: scheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 32),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                FilledButton.icon(
-                  onPressed: () => showSessionEditDialog(context),
-                  icon: const Icon(Icons.add, size: 18),
-                  label: const Text('新建会话'),
+                Container(
+                  width: 148,
+                  height: 148,
+                  decoration: BoxDecoration(
+                    color: scheme.surfaceContainerHigh,
+                    border: Border.all(color: scheme.outlineVariant),
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    Icons.terminal_rounded,
+                    size: 68,
+                    color: scheme.onSurfaceVariant,
+                  ),
                 ),
-                const SizedBox(width: 12),
-                FilledButton.tonalIcon(
-                  onPressed: () => showQuickConnectDialog(context),
-                  icon: const Icon(Icons.bolt_rounded, size: 18),
-                  label: const Text('快速连接'),
+                const SizedBox(height: 28),
+                Text(
+                  '欢迎使用 EShell',
+                  style: Theme.of(context).textTheme.headlineSmall
+                      ?.copyWith(fontWeight: FontWeight.w600),
                 ),
+                const SizedBox(height: 8),
+                Text(
+                  '一个秉承 Material You 设计的 SSH / Telnet / 串口终端',
+                  style: Theme.of(context).textTheme.bodyLarge
+                      ?.copyWith(color: scheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: 32),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    FilledButton.icon(
+                      onPressed: () => showSessionEditDialog(context),
+                      icon: const Icon(Icons.add, size: 18),
+                      label: const Text('新建会话'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: () => showQuickConnectDialog(context),
+                      icon: const Icon(Icons.bolt_rounded, size: 18),
+                      label: const Text('快速连接'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: () => showTelnetScanDialog(context),
+                      icon: const Icon(Icons.radar_rounded, size: 18),
+                      label: const Text('扫描 Telnet'),
+                    ),
+                    FilledButton.tonalIcon(
+                      onPressed: () => app.settings.setShowAiPanel(
+                        !app.settings.showAiPanel,
+                      ),
+                      icon: Icon(
+                        app.settings.showAiPanel
+                            ? Icons.auto_awesome
+                            : Icons.auto_awesome_outlined,
+                        size: 18,
+                      ),
+                      label: Text(app.settings.showAiPanel ? '关闭 AI' : 'AI 助手'),
+                    ),
+                  ],
+                ),
+                if (recentSessions.isNotEmpty) ...[
+                  const SizedBox(height: 36),
+                  Text(
+                    '最近连接',
+                    style: Theme.of(context).textTheme.labelLarge
+                        ?.copyWith(color: scheme.onSurfaceVariant),
+                  ),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    alignment: WrapAlignment.center,
+                    children: recentSessions
+                        .map(
+                          (s) => ActionChip(
+                            avatar: Icon(
+                              Icons.history,
+                              size: 16,
+                              color: scheme.primary,
+                            ),
+                            label: Text(s.displayName),
+                            onPressed: () => app.connect(s),
+                          ),
+                        )
+                        .toList(),
+                  ),
+                ],
               ],
             ),
-            if (recentSessions.isNotEmpty) ...[
-              const SizedBox(height: 36),
-              Text('最近连接',
-                  style: Theme.of(context)
-                      .textTheme
-                      .labelLarge
-                      ?.copyWith(color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                alignment: WrapAlignment.center,
-                children: recentSessions
-                    .map((s) => ActionChip(
-                          avatar: Icon(Icons.history, size: 16, color: scheme.primary),
-                          label: Text(s.displayName),
-                          onPressed: () => app.connect(s),
-                        ))
-                    .toList(),
-              ),
-            ],
-            ],
           ),
-        ),
         ),
       ],
     );

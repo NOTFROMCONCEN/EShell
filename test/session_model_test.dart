@@ -7,7 +7,7 @@ void main() {
       final s = Session(
         id: 'abc123',
         name: '核心交换机',
-        host: '10.0.0.1',
+        host: '198.51.100.1',
         port: 2222,
         username: 'admin',
         authType: SshAuthType.publicKey,
@@ -110,6 +110,57 @@ void main() {
       final s = Session(id: 'x', name: '', host: 'h', username: 'u');
       expect(s.displayName, 'u@h');
       expect(s.address, 'u@h:22');
+    });
+
+    test('Telnet 会话往返：transport/host/port 与显示规则', () {
+      final s = Session(
+        id: 'tn1',
+        name: '',
+        host: '127.0.0.1',
+        port: 32768,
+        transport: SessionTransport.telnet,
+        username: '',
+      );
+      final r = Session.fromJson(s.toJson());
+      expect(r.transport, SessionTransport.telnet);
+      expect(r.host, '127.0.0.1');
+      expect(r.port, 32768);
+      // 无名称时用 host:port 区分不同节点控制台。
+      expect(r.displayName, '127.0.0.1:32768');
+      expect(r.address, 'Telnet · 127.0.0.1:32768');
+    });
+
+    test('Telnet 缺省端口回退 23；旧数据无 transport 仍为 SSH', () {
+      final r = Session.fromJson({
+        'id': 'tn2',
+        'name': '',
+        'host': '198.51.100.9',
+        'transport': 'telnet',
+        'username': '',
+      });
+      expect(r.transport, SessionTransport.telnet);
+      expect(r.port, 23);
+      expect(
+        Session.fromJson({
+          'id': 'x',
+          'name': '',
+          'host': 'h',
+          'username': 'u',
+        }).transport,
+        SessionTransport.ssh,
+      );
+    });
+
+    test('Telnet 有自定义名称时 displayName 取名称', () {
+      final s = Session(
+        id: 'tn3',
+        name: 'EVE R1',
+        host: '127.0.0.1',
+        port: 32768,
+        transport: SessionTransport.telnet,
+        username: '',
+      );
+      expect(s.displayName, 'EVE R1');
     });
   });
 

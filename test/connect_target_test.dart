@@ -5,9 +5,9 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   group('parseConnectTarget · C3 快速连接解析', () {
     test('纯主机名，默认 root:22', () {
-      final t = parseConnectTarget('192.168.1.1')!;
+      final t = parseConnectTarget('192.0.2.1')!;
       expect(t.username, 'root');
-      expect(t.host, '192.168.1.1');
+      expect(t.host, '192.0.2.1');
       expect(t.port, 22);
     });
 
@@ -19,15 +19,15 @@ void main() {
     });
 
     test('host:port', () {
-      final t = parseConnectTarget('192.168.1.1:2222')!;
-      expect(t.host, '192.168.1.1');
+      final t = parseConnectTarget('192.0.2.1:2222')!;
+      expect(t.host, '192.0.2.1');
       expect(t.port, 2222);
     });
 
     test('user@host:port', () {
-      final t = parseConnectTarget('admin@10.0.0.1:2222')!;
+      final t = parseConnectTarget('admin@198.51.100.1:2222')!;
       expect(t.username, 'admin');
-      expect(t.host, '10.0.0.1');
+      expect(t.host, '198.51.100.1');
       expect(t.port, 2222);
     });
 
@@ -81,6 +81,56 @@ void main() {
 
     test('IPv6 缺少右括号报错', () {
       expect(() => parseConnectTarget('[::1'), throwsA(isA<FormatException>()));
+    });
+  });
+
+  group('parseConnectTarget · Telnet 目标', () {
+    test('telnet://host 默认 23', () {
+      final t = parseConnectTarget('telnet://127.0.0.1')!;
+      expect(t.transport, SessionTransport.telnet);
+      expect(t.host, '127.0.0.1');
+      expect(t.port, 23);
+      expect(t.username, '');
+    });
+
+    test('telnet://host:port（EVE-NG 控制台链接）', () {
+      final t = parseConnectTarget('telnet://127.0.0.1:32768')!;
+      expect(t.transport, SessionTransport.telnet);
+      expect(t.host, '127.0.0.1');
+      expect(t.port, 32768);
+    });
+
+    test('协议名大小写不敏感、前后空白与尾部斜杠容错', () {
+      final t = parseConnectTarget('  TELNET://192.0.2.110:32769/  ')!;
+      expect(t.transport, SessionTransport.telnet);
+      expect(t.host, '192.0.2.110');
+      expect(t.port, 32769);
+    });
+
+    test('telnet://user@host:port 中的用户名被忽略', () {
+      final t = parseConnectTarget('telnet://admin@198.51.100.1:32800')!;
+      expect(t.transport, SessionTransport.telnet);
+      expect(t.host, '198.51.100.1');
+      expect(t.port, 32800);
+      expect(t.username, '');
+    });
+
+    test('telnet:// IPv6', () {
+      final t = parseConnectTarget('telnet://[::1]:32768')!;
+      expect(t.host, '::1');
+      expect(t.port, 32768);
+    });
+
+    test('空目标报错', () {
+      expect(() => parseConnectTarget('telnet://'),
+          throwsA(isA<FormatException>()));
+    });
+
+    test('端口越界报错', () {
+      expect(() => parseConnectTarget('telnet://host:65536'),
+          throwsA(isA<FormatException>()));
+      expect(() => parseConnectTarget('telnet://host:abc'),
+          throwsA(isA<FormatException>()));
     });
   });
 

@@ -97,6 +97,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.22.5"
+  desktop_multi_window:
+    dependency: "direct main"
+    description:
+      name: desktop_multi_window
+      sha256: "6a82209dfd29279258515157e5c08612542ebf7bfb3b55fb1dfcd32c076eea4d"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.3.1"
   dynamic_color:
     dependency: "direct main"
     description:
@@ -178,7 +186,7 @@ packages:
     source: hosted
     version: "0.9.5+2"
   file_selector_platform_interface:
-    dependency: transitive
+    dependency: "direct dev"
     description:
       name: file_selector_platform_interface
       sha256: "35e0bd61ebcdb91a3505813b055b09b79dfdc7d0aee9c09a7ba59ae4bb13dc85"

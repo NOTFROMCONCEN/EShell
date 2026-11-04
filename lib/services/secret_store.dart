@@ -21,7 +21,7 @@ class SecretStore {
 
   static const _uiForbidden = 0x1;
 
-  /// 明文 → 密文（已加密或加密失败时原样返回）。
+  /// 明文 → 密文。Windows 加密失败时抛错，禁止把秘密明文写盘。
   static String? protect(String? plain) {
     if (plain == null || plain.isEmpty) return plain;
     if (plain.startsWith(_prefix)) return plain;
@@ -29,9 +29,8 @@ class SecretStore {
     try {
       final encrypted = _crypt(utf16Bytes(plain), encrypt: true);
       return _prefix + base64Encode(encrypted);
-    } catch (_) {
-      // DPAPI 不可用时退回明文，保证功能可用（与旧版本行为一致）。
-      return plain;
+    } catch (e) {
+      throw StateError('无法加密秘密，已取消保存：$e');
     }
   }
 

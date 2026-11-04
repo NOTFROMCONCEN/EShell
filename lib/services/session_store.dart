@@ -22,7 +22,8 @@ class SessionStore {
   static String? knownHostsDirectory;
 
   static Directory _knownHostsDir() {
-    final base = knownHostsDirectory ??
+    final base =
+        knownHostsDirectory ??
         Platform.environment['USERPROFILE'] ??
         Directory.systemTemp.path;
     return Directory('$base\\.eshell');
@@ -56,16 +57,23 @@ class SessionStore {
 
   static Future<void> saveSessions(List<Session> sessions) async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = jsonEncode(sessions
-        .where((s) => !s.isTemporary)
-        .map((s) => s
-            .copyWith(
-              password: SecretStore.protect(s.password),
-              passphrase: SecretStore.protect(s.passphrase),
-            )
-            .toJson())
-        .toList());
-    await prefs.setString(_kSessions, raw);
+    final raw = jsonEncode(
+      sessions
+          .where((s) => !s.isTemporary)
+          .map(
+            (s) => s
+                .copyWith(
+                  password: SecretStore.protect(s.password),
+                  passphrase: SecretStore.protect(s.passphrase),
+                )
+                .toJson(),
+          )
+          .toList(),
+    );
+    final saved = await prefs.setString(_kSessions, raw);
+    if (!saved) {
+      throw StateError('会话数据写入失败');
+    }
   }
 
   /// host:port -> 公钥指纹（`SHA256:<base64>`）。
@@ -92,7 +100,10 @@ class SessionStore {
   }
 
   static Future<void> rememberHostKey(
-      String host, int port, String fingerprint) async {
+    String host,
+    int port,
+    String fingerprint,
+  ) async {
     final known = await loadKnownHosts();
     known['$host:$port'] = fingerprint;
     await _writeKnownHosts(known);
@@ -102,7 +113,8 @@ class SessionStore {
     final dir = _knownHostsDir();
     await dir.create(recursive: true);
     final buffer = StringBuffer(
-        '# EShell known_hosts · host:port SHA256指纹 · 手动删除某行可重置信任\n');
+      '# EShell known_hosts · host:port SHA256指纹 · 手动删除某行可重置信任\n',
+    );
     known.forEach((key, value) => buffer.writeln('$key $value'));
     await _knownHostsFile().writeAsString(buffer.toString(), flush: true);
   }

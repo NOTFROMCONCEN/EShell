@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:eshell/services/serial_port.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -15,8 +17,14 @@ void main() {
       }
     });
 
-    test('扫描（后台 isolate）不抛异常，结果均为合法 COM 口名且升序', () async {
-      final ports = await SerialPort.scanAvailable();
+    test('扫描在时限内结束；成功结果均为合法 COM 口名且升序', () async {
+      List<String> ports;
+      try {
+        ports = await SerialPort.scanAvailable();
+      } on TimeoutException {
+        // 某些硬件驱动的 CreateFile 不返回；扫描必须有界结束。
+        return;
+      }
       // 机器上有没有真实串口均可：只验证扫描流程与名称格式。
       var last = 0;
       for (final p in ports) {

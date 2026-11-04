@@ -7,6 +7,11 @@ import '../models/session.dart';
 /// - `user@host` · `user@host:port`
 /// - `[IPv6]` · `[IPv6]:port`（裸 IPv6 含多个冒号，视为纯主机名）
 ///
+/// Telnet 支持形式（transport = telnet）：
+/// - `telnet://host`（默认 23）
+/// - `telnet://host:port`（EVE-NG 控制台链接即此形式，如
+///   `telnet://127.0.0.1:32768`）；`telnet://user@host:port` 中的用户名忽略
+///
 /// 串口支持形式（transport = serial）：
 /// - `COM3`（默认 9600 波特率）
 /// - `COM3@115200`
@@ -24,13 +29,19 @@ class ConnectTarget {
     this.port = 22,
   }) : transport = SessionTransport.ssh;
 
+  const ConnectTarget.telnet({
+    required this.host,
+    this.port = 23,
+  })  : transport = SessionTransport.telnet,
+        username = '';
+
   final SessionTransport transport;
   final String username;
 
-  /// SSH：主机名/IP；串口：COM 口名（统一大写）。
+  /// SSH/Telnet：主机名/IP；串口：COM 口名（统一大写）。
   final String host;
 
-  /// SSH：端口；串口：波特率。
+  /// SSH/Telnet：端口；串口：波特率。
   final int port;
 }
 
@@ -56,7 +67,27 @@ ConnectTarget? parseConnectTarget(String input) {
   final text = input.trim();
   if (text.isEmpty) return null;
 
-  // 串口形式优先（COM3 / COM3@115200）；COM 口名带 @ 波特率后缀，
+  // Telnet 形式优先：telnet://host[:port]。
+  final telnet =
+      RegExp(r'^telnet://(.*)$', caseSensitive: false).firstMatch(text);
+  if (telnet != null) {
+    var hostPort = telnet.group(1)!.trim();
+    // 容错：去掉导出链接可能带的尾部斜杠。
+    while (hostPort.endsWith('/')) {
+      hostPort = hostPort.substring(0, hostPort.length - 1);
+    }
+    if (hostPort.isEmpty) {
+      throw const FormatException(
+          'Telnet 目标不能为空（示例：telnet://127.0.0.1:32768）');
+    }
+    // Telnet 无认证环节：user@ 前缀忽略，不参与连接。
+    final at = hostPort.lastIndexOf('@');
+    if (at >= 0) hostPort = hostPort.substring(at + 1);
+    final parsed = _parseHostPort(hostPort, defaultPort: 23);
+    return ConnectTarget.telnet(host: parsed.host, port: parsed.port);
+  }
+
+  // 串口形式（COM3 / COM3@115200）；COM 口名带 @ 波特率后缀，
   // 必须在 user@host 拆分之前识别。
   final comOnly = RegExp(r'^com\d+$', caseSensitive: false).firstMatch(text);
   if (comOnly != null) {
@@ -91,7 +122,7 @@ ConnectTarget? parseConnectTarget(String input) {
   var hostPort = text;
   final at = text.indexOf('@');
   if (at == 0) {
-    throw const FormatException('用户名不能为空（示例：admin@192.168.1.1）');
+    throw const FormatException('用户名不能为空（示例：admin@192.0.2.1）');
   }
   if (at > 0) {
     username = text.substring(0, at);
@@ -99,12 +130,25 @@ ConnectTarget? parseConnectTarget(String input) {
     if (hostPort.isEmpty) throw const FormatException('主机不能为空');
   }
 
-  var port = 22;
+  final parsed = _parseHostPort(hostPort, defaultPort: 22);
+  return ConnectTarget.ssh(
+    username: username,
+    host: parsed.host,
+    port: parsed.port,
+  );
+}
+
+/// 解析 `host[:port]` / `[IPv6][:port]`；未写端口时用 [defaultPort]。
+({String host, int port}) _parseHostPort(
+  String hostPort, {
+  required int defaultPort,
+}) {
+  var port = defaultPort;
   String host;
   if (hostPort.startsWith('[')) {
     final close = hostPort.indexOf(']');
     if (close < 0) {
-      throw const FormatException('IPv6 地址缺少 "]"，请用 [::1] 或 [::1]:2222 形式');
+      throw const FormatException('IPv6 地址缺少 "]"；请用 [::1] 或 [::1]:2222 形式');
     }
     host = hostPort.substring(1, close);
     if (close + 1 < hostPort.length) {
@@ -126,7 +170,7 @@ ConnectTarget? parseConnectTarget(String input) {
   }
 
   if (host.isEmpty) throw const FormatException('主机不能为空');
-  return ConnectTarget.ssh(username: username, host: host, port: port);
+  return (host: host, port: port);
 }
 
 int _parsePort(String s) {

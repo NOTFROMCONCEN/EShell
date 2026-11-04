@@ -14,6 +14,7 @@ class SshConnection extends TerminalConnection {
   SshConnection({required super.session});
 
   SSHClient? _client;
+  SSHSocket? _pendingSocket;
   SSHSession? _shell;
   StreamSubscription<Uint8List>? _stdoutSub;
 
@@ -24,6 +25,7 @@ class SshConnection extends TerminalConnection {
       session.port,
       timeout: const Duration(seconds: 12),
     );
+    _pendingSocket = socket;
 
     final knownHosts = await SessionStore.loadKnownHosts();
     final hostKey = '${session.host}:${session.port}';
@@ -68,6 +70,7 @@ class SshConnection extends TerminalConnection {
       },
     );
     _client = client;
+    _pendingSocket = null;
     await client.authenticated;
 
     final shell = await client.shell(
@@ -105,6 +108,8 @@ class SshConnection extends TerminalConnection {
     _stdoutSub = null;
     _client?.close();
     _client = null;
+    await _pendingSocket?.close();
+    _pendingSocket = null;
     _shell = null;
   }
 }

@@ -32,16 +32,23 @@ class _QuickConnectDialogState extends State<_QuickConnectDialog> {
     super.dispose();
   }
 
-  /// C7：按 user@host:port 查找已保存的同类会话，避免每次保存都新增一条。
+  /// C7：按 传输类型 + user@host:port 查找已保存的同类会话，避免每次保存都新增一条。
   Session? _findExisting(AppState app, ConnectTarget target) {
     for (final s in app.sessions) {
-      if (s.host == target.host &&
+      if (s.transport == target.transport &&
+          s.host == target.host &&
           s.port == target.port &&
           s.username == target.username) {
         return s;
       }
     }
     return null;
+  }
+
+  /// 输入形如 telnet://… 时不显示密码框（Telnet 无认证环节）。
+  bool get _isTelnetInput {
+    final text = _target.text.trim().toLowerCase();
+    return text.startsWith('telnet://');
   }
 
   Future<void> _go({required bool save}) async {
@@ -81,7 +88,12 @@ class _QuickConnectDialogState extends State<_QuickConnectDialog> {
       );
     }
     if (save) {
-      await app.upsert(session);
+      try {
+        await app.upsert(session);
+      } catch (e) {
+        if (mounted) setState(() => _error = '保存会话失败：$e');
+        return;
+      }
     }
     if (!mounted) return;
     app.connect(session);
@@ -105,27 +117,26 @@ class _QuickConnectDialogState extends State<_QuickConnectDialog> {
               autofocus: true,
               decoration: InputDecoration(
                 labelText: '目标',
-                hintText: 'admin@192.168.1.1 或 192.168.1.1:2222',
-                helperText: '支持 [IPv6]:端口 · 串口 COM3 或 COM3@115200',
+                hintText: 'admin@192.0.2.1 或 telnet://127.0.0.1:32768',
+                helperText: '支持 [IPv6]:端口 · telnet://主机:端口 · 串口 COM3 或 COM3@115200',
                 errorText: _error,
                 errorMaxLines: 2,
                 prefixIcon: const Icon(Icons.dns_outlined),
               ),
-              onChanged: _error == null
-                  ? null
-                  : (_) => setState(() => _error = null),
+              onChanged: (_) => setState(() => _error = null),
               onSubmitted: (_) => _go(save: false),
             ),
             const SizedBox(height: 4),
-            TextField(
-              controller: _password,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: '密码（可选）',
-                prefixIcon: Icon(Icons.lock_outline),
+            if (!_isTelnetInput)
+              TextField(
+                controller: _password,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: '密码（可选）',
+                  prefixIcon: Icon(Icons.lock_outline),
+                ),
+                onSubmitted: (_) => _go(save: false),
               ),
-              onSubmitted: (_) => _go(save: false),
-            ),
           ],
         ),
       ),

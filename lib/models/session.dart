@@ -1,13 +1,17 @@
-/// 终端会话配置模型（SSH 或串口）。
+/// 终端会话配置模型（SSH / Telnet / 串口）。
 ///
 /// 不可变模型（M3）：所有字段 final，跨处共享同一实例不会被就地改写；
 /// 变更一律通过 [copyWith] 生成新实例后走 `AppState.upsert` 替换。
+///
+/// Telnet 会话（telnet）：
+/// - `host` / `port` 直接是 TCP 目标（如 EVE-NG 节点控制台 127.0.0.1:32768）
+/// - 无认证字段；设备登录提示在终端里交互输入（保存时清空认证字段）
 ///
 /// 串口会话的字段复用约定（serial）：
 /// - `host` = 串口名（如 COM3）
 /// - `port` = 波特率（如 9600）；`autoBaud` 为 true 时作为探测失败兜底值
 /// - `username` / 认证字段不使用（保存时清空）
-enum SessionTransport { ssh, serial }
+enum SessionTransport { ssh, telnet, serial }
 
 /// SSH 认证方式（仅 transport = ssh 时有效）。
 enum SshAuthType { password, publicKey }
@@ -36,7 +40,7 @@ class Session {
   final String name;
   final String host;
 
-  /// SSH：端口号；串口：波特率。
+  /// SSH：端口号；Telnet：TCP 端口；串口：波特率。
   final int port;
 
   final SessionTransport transport;
@@ -60,12 +64,19 @@ class Session {
 
   String get displayName {
     if (name.isNotEmpty) return name;
-    return transport == SessionTransport.serial ? host : '$username@$host';
+    return switch (transport) {
+      SessionTransport.serial => host,
+      SessionTransport.telnet => '$host:$port',
+      SessionTransport.ssh => '$username@$host',
+    };
   }
 
-  String get address => transport == SessionTransport.serial
-      ? (autoBaud ? '$host · 自动波特率' : '$host · $port bps')
-      : '$username@$host:$port';
+  String get address => switch (transport) {
+        SessionTransport.serial =>
+          autoBaud ? '$host · 自动波特率' : '$host · $port bps',
+        SessionTransport.telnet => 'Telnet · $host:$port',
+        SessionTransport.ssh => '$username@$host:$port',
+      };
 
   /// 生成副本。需要把字段清空为 null 时显式传 `null`；
   /// 不传（保持默认哨兵值）则沿用原值。
@@ -129,25 +140,35 @@ class Session {
         'lastConnectedAt': lastConnectedAt?.toIso8601String(),
       };
 
-  factory Session.fromJson(Map<String, dynamic> json) => Session(
-        id: json['id'] as String,
-        name: (json['name'] ?? '') as String,
-        host: (json['host'] ?? '') as String,
-        port: json['port'] is num ? (json['port'] as num).toInt() : 22,
-        transport: json['transport'] == 'serial'
-            ? SessionTransport.serial
-            : SessionTransport.ssh,
-        autoBaud: json['autoBaud'] == true,
-        username: (json['username'] ?? 'root') as String,
-        authType: json['authType'] == 'publicKey'
-            ? SshAuthType.publicKey
-            : SshAuthType.password,
-        password: json['password'] as String?,
-        passphrase: json['passphrase'] as String?,
-        privateKeyPath: json['privateKeyPath'] as String?,
-        tag: json['tag'] as String?,
-        lastConnectedAt: json['lastConnectedAt'] == null
-            ? null
-            : DateTime.parse(json['lastConnectedAt'] as String),
-      );
+  factory Session.fromJson(Map<String, dynamic> json) {
+    final transport = switch (json['transport']) {
+      'telnet' => SessionTransport.telnet,
+      'serial' => SessionTransport.serial,
+      _ => SessionTransport.ssh,
+    };
+    final defaultPort = switch (transport) {
+      SessionTransport.serial => 9600,
+      SessionTransport.telnet => 23,
+      SessionTransport.ssh => 22,
+    };
+    return Session(
+      id: json['id'] as String,
+      name: (json['name'] ?? '') as String,
+      host: (json['host'] ?? '') as String,
+      port: json['port'] is num ? (json['port'] as num).toInt() : defaultPort,
+      transport: transport,
+      autoBaud: json['autoBaud'] == true,
+      username: (json['username'] ?? 'root') as String,
+      authType: json['authType'] == 'publicKey'
+          ? SshAuthType.publicKey
+          : SshAuthType.password,
+      password: json['password'] as String?,
+      passphrase: json['passphrase'] as String?,
+      privateKeyPath: json['privateKeyPath'] as String?,
+      tag: json['tag'] as String?,
+      lastConnectedAt: json['lastConnectedAt'] == null
+          ? null
+          : DateTime.parse(json['lastConnectedAt'] as String),
+    );
+  }
 }

@@ -46,3 +46,26 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# 发布打包产物
+/dist/
+
+# 本地运行产物与截图（不应进入源码仓库）
+/out/
+/.v2c/
+/.superpowers/
+/docs/superpowers/
+
+# 本地配置、凭据与证书
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+**/known_hosts
+**/credentials*
+**/secrets*

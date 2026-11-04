@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -83,8 +84,6 @@ class SerialPort {
       final buf = calloc<Uint16>(size);
       final n = _queryDosDevice(nullptr, buf, size);
       final err = _lastError();
-      calloc.free(buf);
-
       if (n > 0) {
         // 缓冲区是连续 \0 结尾的字符串序列，双 \0 表示结束。
         final ports = <String, int>{};
@@ -102,8 +101,10 @@ class SerialPort {
         }
         final names = ports.keys.toList();
         names.sort((a, b) => ports[a]!.compareTo(ports[b]!));
+        calloc.free(buf);
         return names;
       }
+      calloc.free(buf);
       if (err != 122) return const []; // 122 = ERROR_INSUFFICIENT_BUFFER
       size *= 2;
     }
@@ -115,8 +116,31 @@ class SerialPort {
   ///
   /// 整段在后台 isolate 运行（Isolate.run）：驱动初始化慢的口
   /// （蓝牙串口/USB 转串）也只会拖慢扫描，不会冻结 UI。
-  static Future<List<String>> scanAvailable({int max = 99}) =>
-      Isolate.run(() => _scanAvailableSync(max: max));
+  static Future<List<String>> scanAvailable({
+    int max = 99,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final port = ReceivePort();
+    final isolate = await Isolate.spawn(_scanWorker, [port.sendPort, max]);
+    try {
+      final result = await port.first.timeout(timeout);
+      if (result is List<String>) return result;
+      throw StateError('串口扫描失败：$result');
+    } finally {
+      isolate.kill(priority: Isolate.immediate);
+      port.close();
+    }
+  }
+
+  static void _scanWorker(List<Object> args) {
+    final sendPort = args[0] as SendPort;
+    final max = args[1] as int;
+    try {
+      sendPort.send(_scanAvailableSync(max: max));
+    } catch (e) {
+      sendPort.send(e.toString());
+    }
+  }
 
   static List<String> _scanAvailableSync({required int max}) {
     final present = systemPortNames()

@@ -28,13 +28,13 @@ void main() {
 
     test('remember 后 load 可读回（TOFU 记录）', () async {
       await SessionStore.rememberHostKey(
-          '10.0.0.1', 22, 'SHA256:AAAA1111');
+          '198.51.100.1', 22, 'SHA256:AAAA1111');
       await SessionStore.rememberHostKey(
-          '10.0.0.2', 2222, 'SHA256:BBBB2222');
+          '198.51.100.2', 2222, 'SHA256:BBBB2222');
 
       final known = await SessionStore.loadKnownHosts();
-      expect(known['10.0.0.1:22'], 'SHA256:AAAA1111');
-      expect(known['10.0.0.2:2222'], 'SHA256:BBBB2222');
+      expect(known['198.51.100.1:22'], 'SHA256:AAAA1111');
+      expect(known['198.51.100.2:2222'], 'SHA256:BBBB2222');
     });
 
     test('同 host:port 重复记录覆盖旧指纹', () async {
